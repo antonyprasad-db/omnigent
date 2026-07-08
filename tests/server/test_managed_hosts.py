@@ -15,6 +15,9 @@ from httpx import ASGITransport, AsyncClient
 from omnigent.db.utils import now_epoch
 from omnigent.onboarding.sandboxes.base import render_host_config_write_command
 from omnigent.onboarding.sandboxes.e2b import managed_token_ttl_s as e2b_managed_token_ttl_s
+from omnigent.onboarding.sandboxes.lambda_microvm import (
+    managed_token_ttl_s as lambda_microvm_managed_token_ttl_s,
+)
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.managed_hosts import (
@@ -47,6 +50,7 @@ from tests.server.helpers import (
     install_fake_e2b_launcher,
     install_fake_islo_launcher,
     install_fake_kubernetes_launcher,
+    install_fake_lambda_microvm_launcher,
     install_fake_modal_launcher,
     install_fake_openshell_launcher,
 )
@@ -698,6 +702,74 @@ def test_parse_kubernetes_invalid_block_fails_loud(
                 "provider": "kubernetes",
                 "server_url": "http://s.svc.cluster.local",
                 "kubernetes": kubernetes_block,
+            }
+        )
+
+
+def test_parse_valid_lambda_microvm_config_builds_parameterized_factory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The documented lambda_microvm YAML shape parses into a config whose factory
+    constructs Lambda MicroVM launchers carrying region / image / version /
+    execution role / env, with the 8 h-derived token TTL.
+    """
+    cfg = parse_sandbox_config(
+        {
+            "provider": "lambda_microvm",
+            "server_url": "https://srv.example.com/",
+            "lambda_microvm": {
+                "region": "us-east-1",
+                "image_identifier": "omnigent-host",
+                "image_version": "1.0",
+                "execution_role_arn": "arn:aws:iam::123456789012:role/omnigent-microvm-exec",
+                "env": ["ANTHROPIC_API_KEY", "GIT_TOKEN"],
+            },
+        }
+    )
+    assert cfg is not None
+    assert cfg.server_url == "https://srv.example.com"
+    assert cfg.token_ttl_s == lambda_microvm_managed_token_ttl_s()
+    assert cfg.managed_launch_supported is True
+    assert cfg.provider == "lambda_microvm"
+    fake = FakeSandboxLauncher()
+    install_fake_lambda_microvm_launcher(monkeypatch, fake)
+    assert cfg.launcher_factory() is fake
+    assert fake.region == "us-east-1"
+    assert fake.image_identifier == "omnigent-host"
+    assert fake.image_version == "1.0"
+    assert fake.execution_role_arn == "arn:aws:iam::123456789012:role/omnigent-microvm-exec"
+    assert fake.env == ["ANTHROPIC_API_KEY", "GIT_TOKEN"]
+
+
+def test_parse_lambda_microvm_without_section_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    `provider: lambda_microvm` + `server_url` parses: optional fields reach the
+    launcher as None so its env-var fallbacks apply (image/role required at
+    launch, surfaced by the launcher's own prepare()).
+    """
+    cfg = parse_sandbox_config(
+        {"provider": "lambda_microvm", "server_url": "https://srv.example.com"}
+    )
+    assert cfg is not None
+    assert cfg.provider == "lambda_microvm"
+    fake = FakeSandboxLauncher()
+    install_fake_lambda_microvm_launcher(monkeypatch, fake)
+    assert cfg.launcher_factory() is fake
+    assert fake.region is None
+    assert fake.image_identifier is None
+    assert fake.execution_role_arn is None
+    assert fake.env is None
+
+
+def test_parse_lambda_microvm_rejects_non_string_field() -> None:
+    """A malformed lambda_microvm field fails parse loud, not at launch."""
+    with pytest.raises(ValueError, match=r"sandbox\.lambda_microvm\.region"):
+        parse_sandbox_config(
+            {
+                "provider": "lambda_microvm",
+                "server_url": "https://srv.example.com",
+                "lambda_microvm": {"region": 123},
             }
         )
 

@@ -70,6 +70,9 @@ _LAUNCHERS: dict[str, str] = {
     # On-demand Kubernetes runner Pod via the official kubernetes client (the
     # `omnigent[kubernetes]` extra), imported lazily like modal/daytona.
     "kubernetes": "omnigent.onboarding.sandboxes.kubernetes:KubernetesSandboxLauncher",
+    # AWS Lambda MicroVMs via boto3 (the `omnigent[lambda-microvm]` extra),
+    # imported lazily like modal/daytona.
+    "lambda_microvm": "omnigent.onboarding.sandboxes.lambda_microvm:LambdaMicroVMSandboxLauncher",
 }
 
 

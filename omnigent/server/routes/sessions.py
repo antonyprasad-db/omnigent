@@ -641,6 +641,13 @@ _HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S = 30.0
 # the query can only make the cold path faster, never slower.
 _HOST_RUNNER_STATUS_TIMEOUT_S = 3.0
 _MANAGED_RESUMABLE_TUNNEL_STALE_S = 30.0
+# Budget for a freshly provisioned managed sandbox's FIRST tunnel connect —
+# separate from _HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S (which times a warm
+# host's runner reconnect). A cold MicroVM boot (RunMicrovm -> RUNNING -> /run
+# hook -> omnigent host dial-back) can take 30-90s; 30s is too tight and
+# strands the session with a host that reads online but was never sent
+# launch_runner.
+_MANAGED_HOST_CONNECT_TIMEOUT_S = 120.0
 # How often the runner-connect wait re-checks the crash-report store while
 # racing the event-driven connect signal. Small enough that conviction is
 # detected within a fraction of a second of the daemon's report, without
@@ -6770,6 +6777,18 @@ async def _launch_runner_on_host(
     except asyncio.TimeoutError:
         # No result yet — fall through to the caller's connect wait, which
         # preserves the prior fire-and-forget timing for a slow-but-fine host.
+        # Silent otherwise, but a host that never answers (frame lost, host
+        # busy, or refuses without a result frame) then surfaces only as an
+        # opaque RUNNER_UNAVAILABLE once the caller's own wait expires — log
+        # so an operator can tell "no answer yet" from "host never got it".
+        _logger.info(
+            "No launch_runner result from host %s within %ss for session %s "
+            "(request_id=%s); falling through to the connect wait",
+            conv.host_id,
+            _HOST_LAUNCH_RESULT_TIMEOUT_S,
+            conv.id,
+            request_id,
+        )
         host_conn.pending_launches.pop(request_id, None)
         return _HostLaunchAttempt(runner_id=new_runner_id)
     if result.get("status") == "failed":
@@ -7045,6 +7064,39 @@ async def _bind_and_launch_managed_runner(
     runner_id: str | None = None
     if host_registry is not None:
         host_conn = host_registry.get(managed.host_id)
+        if host_conn is None:
+            # A freshly provisioned sandbox (e.g. a Lambda MicroVM that boots,
+            # runs its /run hook, then dials back) can take tens of seconds to
+            # register its tunnel — the bind above completes well before the
+            # host connection lands on this replica. Poll until it appears so
+            # the runner launches, instead of settling "ready" with no runner
+            # (which strands the session: the host reads online, so the message
+            # relaunch path won't wake it either). The budget covers a cold
+            # MicroVM boot (run → RUNNING → /run hook → omnigent host dial-back).
+            _host_connect_deadline = time.monotonic() + _MANAGED_HOST_CONNECT_TIMEOUT_S
+            while host_conn is None and time.monotonic() < _host_connect_deadline:
+                await asyncio.sleep(0.5)
+                host_conn = host_registry.get(managed.host_id)
+            if host_conn is None:
+                # The host never dialed back within the budget. Falling through
+                # to "ready" here would strand the session (host reads online so
+                # the message-relaunch path won't wake it, yet no runner exists).
+                # Fail the launch loudly, mirroring the harness-not-configured
+                # path below and the delete-during-provisioning path above.
+                reason = (
+                    f"managed host did not register its tunnel within "
+                    f"{_MANAGED_HOST_CONNECT_TIMEOUT_S}s of provisioning"
+                )
+                _logger.warning(
+                    "Managed host %s for session %s did not register its tunnel "
+                    "within %ss of provisioning; failing the launch",
+                    managed.host_id,
+                    session_id,
+                    _MANAGED_HOST_CONNECT_TIMEOUT_S,
+                )
+                tracker.fail(session_id, reason)
+                _publish_sandbox_status(session_id, "failed", reason)
+                return
         if host_conn is not None:
             launch_attempt = await _launch_runner_on_host(
                 conv,
