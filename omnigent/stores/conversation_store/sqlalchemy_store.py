@@ -3563,14 +3563,89 @@ class SqlAlchemyConversationStore(ConversationStore):
         :returns: ``True`` if the conversation existed,
             ``False`` otherwise.
         """
-        # The conversation subtree lives in the AP DB; collect IDs there first.
+        if self._same_db:
+            # Single-DB: run the entire delete in one transaction so that
+            # AP rows (items, labels, conversations) and Omnigent rows
+            # (comments, policies, permissions, metadata) are removed
+            # atomically — matching the behaviour before the table split.
+            with self._session() as session:
+                row = session.get(SqlConversation, (current_workspace_id(), conversation_id))
+                if not row:
+                    return False
+                cte = (
+                    select(SqlConversation.id)
+                    .where(
+                        SqlConversation.workspace_id == current_workspace_id(),
+                        SqlConversation.id == conversation_id,
+                    )
+                    .cte(name="subtree", recursive=True)
+                )
+                cte = cte.union_all(
+                    select(SqlConversation.id).where(
+                        SqlConversation.workspace_id == current_workspace_id(),
+                        SqlConversation.parent_conversation_id == cte.c.id,
+                    )
+                )
+                subtree_ids = [r[0] for r in session.execute(select(cte.c.id)).fetchall()]
+                for conv_id in subtree_ids:
+                    delete_fts_by_conversation(session, conv_id)
+                session.execute(
+                    delete(SqlConversationItem).where(
+                        SqlConversationItem.workspace_id == current_workspace_id(),
+                        SqlConversationItem.conversation_id.in_(subtree_ids),
+                    )
+                )
+                session.execute(
+                    delete(SqlConversationLabel).where(
+                        SqlConversationLabel.workspace_id == current_workspace_id(),
+                        SqlConversationLabel.conversation_id.in_(subtree_ids),
+                    )
+                )
+                session.execute(
+                    delete(SqlComment).where(
+                        SqlComment.workspace_id == current_workspace_id(),
+                        SqlComment.conversation_id.in_(subtree_ids),
+                    )
+                )
+                session.execute(
+                    delete(SqlPolicy).where(
+                        SqlPolicy.workspace_id == current_workspace_id(),
+                        SqlPolicy.session_id.in_(subtree_ids),
+                    )
+                )
+                session.execute(
+                    delete(SqlSessionPermission).where(
+                        SqlSessionPermission.workspace_id == current_workspace_id(),
+                        SqlSessionPermission.conversation_id.in_(subtree_ids),
+                    )
+                )
+                session.execute(
+                    delete(SqlConversationMetadata).where(
+                        SqlConversationMetadata.workspace_id == current_workspace_id(),
+                        SqlConversationMetadata.id.in_(subtree_ids),
+                    )
+                )
+                session.execute(
+                    delete(SqlConversation).where(
+                        SqlConversation.workspace_id == current_workspace_id(),
+                        SqlConversation.id.in_(subtree_ids),
+                        SqlConversation.id != conversation_id,
+                    )
+                )
+                session.delete(row)
+            return True
+
+        # Split-DB: AP rows and Omnigent rows are in different databases; two
+        # transactions are unavoidable. AP rows are deleted first so the
+        # conversation is immediately unreachable; Omnigent-side orphans
+        # (metadata/comments/policies/permissions) are cleaned up second.
+        # A failure of the second transaction leaves behind orphaned Omnigent
+        # rows for a conversation that no longer exists — an acceptable
+        # best-effort tradeoff documented in the split-DB design.
         with self._conv_session() as ap_sess:
             row = ap_sess.get(SqlConversation, (current_workspace_id(), conversation_id))
             if not row:
                 return False
-
-            # Collect all descendant IDs via a recursive CTE so we can
-            # clean up the full subtree in one pass.
             cte = (
                 select(SqlConversation.id)
                 .where(
@@ -3585,13 +3660,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                     SqlConversation.parent_conversation_id == cte.c.id,
                 )
             )
-            subtree_ids_rows = ap_sess.execute(select(cte.c.id)).fetchall()
-            subtree_ids = [r[0] for r in subtree_ids_rows]
-
-            # Delete AP-side child rows (items, labels, FTS) for the subtree.
+            subtree_ids = [r[0] for r in ap_sess.execute(select(cte.c.id)).fetchall()]
             for conv_id in subtree_ids:
                 delete_fts_by_conversation(ap_sess, conv_id)
-
             ap_sess.execute(
                 delete(SqlConversationItem).where(
                     SqlConversationItem.workspace_id == current_workspace_id(),
@@ -3604,9 +3675,6 @@ class SqlAlchemyConversationStore(ConversationStore):
                     SqlConversationLabel.conversation_id.in_(subtree_ids),
                 )
             )
-
-            # Delete conversation rows children-first so any residual
-            # ordering constraints are satisfied.
             ap_sess.execute(
                 delete(SqlConversation).where(
                     SqlConversation.workspace_id == current_workspace_id(),
@@ -3616,7 +3684,6 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
             ap_sess.delete(row)
 
-        # Delete Omnigent-side rows (comments, policies, permissions, metadata).
         with self._session() as session:
             session.execute(
                 delete(SqlComment).where(
