@@ -35,8 +35,27 @@ from omnigent.db.compression import CompressedText
 _CKSUM32 = LargeBinary(32).with_variant(MySQLBinary(32), "mysql")
 
 
-class Base(DeclarativeBase):
-    """Shared declarative base for all omnigent tables."""
+class OmnigentBase(DeclarativeBase):
+    """Declarative base for the Omnigent operational tables.
+
+    Covers agents, files, users, tokens, session permissions,
+    conversation metadata, comments, policies, hosts, and daily costs.
+    Grouped under their own ``metadata`` so schema creation and Alembic
+    autogenerate can target the Omnigent side independently of the
+    conversation tables.
+    """
+
+
+class ConversationBase(DeclarativeBase):
+    """Declarative base for the conversation tables.
+
+    Covers ``conversations``, ``conversation_items``, and
+    ``conversation_labels`` — the user-facing conversation surface
+    (the Agent-Platform-side tables). Kept under their own ``metadata``
+    so they can be created and, when ``conversation_storage_location``
+    is configured, hosted on a separate physical database from the
+    Omnigent tables.
+    """
 
 
 # Default workspace id stamped on every row and used as the leading
@@ -90,7 +109,7 @@ POLICY_SCOPE_DEFAULT = "default"
 POLICY_SCOPE_SESSION = "session"
 
 
-class SqlAgent(Base):
+class SqlAgent(OmnigentBase):
     """
     SQLAlchemy model for the ``agents`` table.
 
@@ -150,7 +169,7 @@ class SqlAgent(Base):
     )
 
 
-class SqlFile(Base):
+class SqlFile(OmnigentBase):
     """
     SQLAlchemy model for the ``files`` table.
 
@@ -195,7 +214,7 @@ class SqlFile(Base):
     )
 
 
-class SqlUser(Base):
+class SqlUser(OmnigentBase):
     """
     SQLAlchemy model for the ``users`` table.
 
@@ -237,7 +256,7 @@ class SqlUser(Base):
     last_login_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
 
-class SqlAccountToken(Base):
+class SqlAccountToken(OmnigentBase):
     """
     SQLAlchemy model for the ``account_tokens`` table.
 
@@ -298,7 +317,7 @@ class SqlAccountToken(Base):
     )
 
 
-class SqlSessionPermission(Base):
+class SqlSessionPermission(OmnigentBase):
     """
     SQLAlchemy model for the ``session_permissions`` table.
 
@@ -352,7 +371,7 @@ class SqlSessionPermission(Base):
     )
 
 
-class SqlConversationMetadata(Base):
+class SqlConversationMetadata(OmnigentBase):
     """
     SQLAlchemy model for the ``omnigent_conversation_metadata`` table.
 
@@ -403,7 +422,7 @@ class SqlConversationMetadata(Base):
     )
 
 
-class SqlConversation(Base):
+class SqlConversation(ConversationBase):
     """
     SQLAlchemy model for the ``conversations`` table.
 
@@ -508,7 +527,7 @@ class SqlConversation(Base):
     )
 
 
-class SqlConversationItem(Base):
+class SqlConversationItem(ConversationBase):
     """
     SQLAlchemy model for the ``conversation_items`` table.
 
@@ -600,7 +619,7 @@ class SqlConversationItem(Base):
 LABEL_VALUE_MAX_LEN = 256
 
 
-class SqlConversationLabel(Base):
+class SqlConversationLabel(ConversationBase):
     """
     SQLAlchemy model for the ``conversation_labels`` table.
 
@@ -649,7 +668,7 @@ class SqlConversationLabel(Base):
     updated_at: Mapped[int] = mapped_column(Integer)
 
 
-class SqlComment(Base):
+class SqlComment(OmnigentBase):
     """SQLAlchemy model for the ``comments`` table.
 
     Stores per-review comments associated with a conversation.
@@ -745,7 +764,7 @@ def _default_policy_name_cksum(context: Any) -> bytes:
     return policy_name_cksum(context.get_current_parameters()["name"])
 
 
-class SqlPolicy(Base):
+class SqlPolicy(OmnigentBase):
     """
     SQLAlchemy model for the ``policies`` table.
 
@@ -854,7 +873,7 @@ class SqlPolicy(Base):
     )
 
 
-class SqlHost(Base):
+class SqlHost(OmnigentBase):
     """
     SQLAlchemy model for the ``hosts`` table.
 
@@ -944,7 +963,7 @@ class SqlHost(Base):
     )
 
 
-class SqlUserDailyCost(Base):
+class SqlUserDailyCost(OmnigentBase):
     """
     SQLAlchemy model for the ``user_daily_cost`` table.
 

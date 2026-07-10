@@ -321,7 +321,7 @@ def get_or_create_conversation_engine(conv_uri: str) -> Engine:
 
     Unlike :func:`get_or_create_engine`, this does NOT run Alembic
     migrations — the AP DB is expected to be a fresh database that
-    gets its tables created via ``Base.metadata.create_all()``.
+    gets its tables created via ``ConversationBase.metadata.create_all()``.
     For the common case where AP DB == Omnigent DB, callers should
     use :func:`get_or_create_engine` directly and share the engine.
 
@@ -342,15 +342,9 @@ def get_or_create_conversation_engine(conv_uri: str) -> Engine:
 
 def _ensure_conversation_tables(engine: Engine) -> None:
     """Create AP tables (conversations, conversation_items, conversation_labels) if absent."""
-    from omnigent.db.db_models import (
-        SqlConversation,
-        SqlConversationItem,
-        SqlConversationLabel,
-    )
+    from omnigent.db.db_models import ConversationBase
 
-    SqlConversation.__table__.create(bind=engine, checkfirst=True)
-    SqlConversationItem.__table__.create(bind=engine, checkfirst=True)
-    SqlConversationLabel.__table__.create(bind=engine, checkfirst=True)
+    ConversationBase.metadata.create_all(bind=engine, checkfirst=True)
     ensure_fts_table(engine)
 
 
@@ -401,7 +395,7 @@ def _run_migrations(engine: Engine, db_uri: str) -> None:
     """
     from alembic import command
 
-    from omnigent.db.db_models import Base
+    from omnigent.db.db_models import ConversationBase, OmnigentBase
 
     _logger.info("Running database migrations...")
     config = _build_alembic_config(db_uri)
@@ -416,8 +410,10 @@ def _run_migrations(engine: Engine, db_uri: str) -> None:
     # at least create any missing tables from ORM metadata so the
     # server still boots. Cannot rescue missing COLUMNS on existing
     # tables — those need a real migration, which is why the
-    # short-circuit above was removed.
-    Base.metadata.create_all(bind=engine, checkfirst=True)
+    # short-circuit above was removed. Both bases are created because
+    # in single-DB mode this engine hosts the AP tables too.
+    for base in (OmnigentBase, ConversationBase):
+        base.metadata.create_all(bind=engine, checkfirst=True)
 
 
 def _get_current_db_revision(engine: Engine) -> str | None:
