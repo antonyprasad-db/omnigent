@@ -54,6 +54,7 @@ from omnigent.db.utils import (
     extract_search_text,
     generate_conversation_id,
     generate_item_id,
+    get_or_create_conversation_engine,
     get_or_create_engine,
     insert_fts,
     make_managed_session_maker,
@@ -616,22 +617,19 @@ class SqlAlchemyConversationStore(ConversationStore):
         self._session_immediate = make_managed_session_maker(self._engine, immediate=True)
 
         # Agent Platform DB: conversations, conversation_items, conversation_labels.
-        # Defaults to the Omnigent DB when not separately configured.
+        # Defaults to the Omnigent DB when not separately configured. Always creates
+        # a separate session factory so AP and Omnigent writes run in independent
+        # transactions, even when both point at the same underlying engine.
         conv_uri = conversation_storage_location or storage_location
-        self._same_db = conv_uri == storage_location
-        if self._same_db:
-            # Share the engine so cross-table operations stay in one transaction.
-            self._conv_engine = self._engine
-            self._conv_session = self._session
-            self._conv_session_immediate = self._session_immediate
-        else:
-            from omnigent.db.utils import get_or_create_conversation_engine
-
-            self._conv_engine = get_or_create_conversation_engine(conv_uri)
-            self._conv_session = make_managed_session_maker(self._conv_engine)
-            self._conv_session_immediate = make_managed_session_maker(
-                self._conv_engine, immediate=True
-            )
+        self._conv_engine = (
+            self._engine
+            if conv_uri == storage_location
+            else get_or_create_conversation_engine(conv_uri)
+        )
+        self._conv_session = make_managed_session_maker(self._conv_engine)
+        self._conv_session_immediate = make_managed_session_maker(
+            self._conv_engine, immediate=True
+        )
 
         # Dialect-appropriate row-locking flags. Each flag is derived from its
         # own engine so a mixed-dialect split-DB (e.g. Postgres AP + SQLite
@@ -653,19 +651,11 @@ class SqlAlchemyConversationStore(ConversationStore):
         ensure_fts_table(self._conv_engine)
 
     def _get_meta(
-        self, session_or_conv_session: Session, conversation_id: str
+        self, _unused_session: Session, conversation_id: str
     ) -> SqlConversationMetadata | None:
         """
-        Fetch the metadata row for a conversation.
-
-        When same-DB, ``session_or_conv_session`` may be either the AP session
-        or the Omnigent session (same engine). When split-DB, this opens a
-        separate Omnigent session.
+        Fetch the metadata row for a conversation from the Omnigent DB.
         """
-        if self._same_db:
-            return session_or_conv_session.get(
-                SqlConversationMetadata, (current_workspace_id(), conversation_id)
-            )
         with self._session() as meta_sess:
             return meta_sess.get(
                 SqlConversationMetadata, (current_workspace_id(), conversation_id)
@@ -802,99 +792,47 @@ class SqlAlchemyConversationStore(ConversationStore):
         now = now_epoch()
         new_id = generate_conversation_id()
         try:
-            if self._same_db:
-                with self._session() as session:
-                    if parent_conversation_id is None:
-                        # Top-level conversation: root_id == own id, so the
-                        # tree-scoped index covers the row from the moment
-                        # it lands.
-                        root_id: str = new_id
-                    else:
-                        parent_row = session.get(
-                            SqlConversation, (current_workspace_id(), parent_conversation_id)
-                        )
-                        if parent_row is None:
-                            raise ConversationNotFoundError(
-                                f"parent conversation {parent_conversation_id!r} does not exist"
-                            )
-                        # Inherit the parent's root: nested sub-agents all
-                        # share the same root with their top-level ancestor.
-                        root_id = parent_row.root_conversation_id
-                    # Sub-agent children must have a unique title per parent because
-                    # of ix_conversations_parent_title_unique.
-                    if parent_conversation_id is not None and not title:
-                        title = f"untitled:{new_id}"
-                    row = SqlConversation(
-                        id=new_id,
-                        created_at=now,
-                        updated_at=now,
-                        title=title or "",
-                        parent_conversation_id=parent_conversation_id,
-                        root_conversation_id=root_id,
-                        agent_id=agent_id,
-                    )
-                    meta = SqlConversationMetadata(
-                        id=new_id,
-                        kind=encode_conversation_kind(kind),
-                        runner_id=runner_id,
-                        host_id=host_id,
-                        sub_agent_name=sub_agent_name,
-                        workspace=workspace,
-                        git_branch=git_branch,
-                        terminal_launch_args=(
-                            json.dumps(terminal_launch_args)
-                            if terminal_launch_args is not None
-                            else None
-                        ),
-                        archived=False,
-                    )
-                    session.add(row)
-                    session.add(meta)
-                    return _to_conversation(row, meta)
-            else:
-                # Split-DB: get parent's root from AP, then write rows separately.
-                root_id = new_id
-                if parent_conversation_id is not None:
-                    with self._conv_session() as ap_sess:
-                        parent_row = ap_sess.get(
-                            SqlConversation, (current_workspace_id(), parent_conversation_id)
-                        )
-                        if parent_row is None:
-                            raise ConversationNotFoundError(
-                                f"parent conversation {parent_conversation_id!r} does not exist"
-                            )
-                        root_id = parent_row.root_conversation_id
-                if parent_conversation_id is not None and not title:
-                    title = f"untitled:{new_id}"
+            # Get parent's root from AP, then write AP row and Omnigent meta separately.
+            root_id = new_id
+            if parent_conversation_id is not None:
                 with self._conv_session() as ap_sess:
-                    row = SqlConversation(
-                        id=new_id,
-                        created_at=now,
-                        updated_at=now,
-                        title=title or "",
-                        parent_conversation_id=parent_conversation_id,
-                        root_conversation_id=root_id,
-                        agent_id=agent_id,
+                    parent_row = ap_sess.get(
+                        SqlConversation, (current_workspace_id(), parent_conversation_id)
                     )
-                    ap_sess.add(row)
-                meta = SqlConversationMetadata(
+                    if parent_row is None:
+                        raise ConversationNotFoundError(
+                            f"parent conversation {parent_conversation_id!r} does not exist"
+                        )
+                    root_id = parent_row.root_conversation_id
+            if parent_conversation_id is not None and not title:
+                title = f"untitled:{new_id}"
+            with self._conv_session() as ap_sess:
+                row = SqlConversation(
                     id=new_id,
-                    kind=encode_conversation_kind(kind),
-                    runner_id=runner_id,
-                    host_id=host_id,
-                    sub_agent_name=sub_agent_name,
-                    workspace=workspace,
-                    git_branch=git_branch,
-                    terminal_launch_args=(
-                        json.dumps(terminal_launch_args)
-                        if terminal_launch_args is not None
-                        else None
-                    ),
-                    archived=False,
+                    created_at=now,
+                    updated_at=now,
+                    title=title or "",
+                    parent_conversation_id=parent_conversation_id,
+                    root_conversation_id=root_id,
+                    agent_id=agent_id,
                 )
-                with self._session() as meta_sess:
-                    meta_sess.add(meta)
-                return _to_conversation(row, meta)
+                ap_sess.add(row)
+            meta = SqlConversationMetadata(
+                id=new_id,
+                kind=encode_conversation_kind(kind),
+                runner_id=runner_id,
+                host_id=host_id,
+                sub_agent_name=sub_agent_name,
+                workspace=workspace,
+                git_branch=git_branch,
+                terminal_launch_args=(
+                    json.dumps(terminal_launch_args) if terminal_launch_args is not None else None
+                ),
+                archived=False,
+            )
+            with self._session() as meta_sess:
+                meta_sess.add(meta)
+            return _to_conversation(row, meta)
         except IntegrityError as exc:
             # Translate the unique-index violation into a
             # clean exception type the spawn/send tools can map
@@ -1054,20 +992,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             # too — _to_conversation reads ORM columns, which would raise
             # DetachedInstanceError once the session closes.
             labels_by_conv = _fetch_labels_bulk(session, [row.id for row in rows])
-            if self._same_db:
-                meta_rows = (
-                    session.execute(
-                        select(SqlConversationMetadata).where(
-                            SqlConversationMetadata.workspace_id == current_workspace_id(),
-                            SqlConversationMetadata.id.in_(unique_ids),
-                        )
-                    )
-                    .scalars()
-                    .all()
-                )
-            else:
-                meta_rows = []
-        if not self._same_db and rows:
+        meta_rows = []
+        if rows:
             row_ids = [r.id for r in rows]
             with self._session() as meta_sess:
                 meta_rows = (
@@ -1872,79 +1798,40 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
         from omnigent.server.auth import LEVEL_OWNER
 
-        if self._same_db:
-            # Single-DB: JOIN conversation_labels with metadata for archived filter.
-            with self._conv_session() as session:
-                stmt = (
-                    select(SqlConversationLabel.value)
-                    .join(
-                        SqlConversationMetadata,
-                        (SqlConversationMetadata.id == SqlConversationLabel.conversation_id)
-                        & (
-                            SqlConversationMetadata.workspace_id
-                            == SqlConversationLabel.workspace_id
-                        ),
-                    )
-                    .where(
-                        SqlConversationLabel.workspace_id == current_workspace_id(),
-                        SqlConversationMetadata.workspace_id == current_workspace_id(),
-                        SqlConversationLabel.key == PROJECT_LABEL_KEY,
-                        SqlConversationMetadata.archived.is_(False),
-                    )
-                    .distinct()
-                    .order_by(SqlConversationLabel.value)
+        # Get non-archived IDs from Omnigent, then filter labels in AP.
+        with self._session() as meta_sess:
+            non_archived_q = select(SqlConversationMetadata.id).where(
+                SqlConversationMetadata.workspace_id == current_workspace_id(),
+                SqlConversationMetadata.archived.is_(False),
+            )
+            if accessible_by is not None:
+                accessible_ids = select(SqlSessionPermission.conversation_id).where(
+                    SqlSessionPermission.workspace_id == current_workspace_id(),
+                    SqlSessionPermission.user_id == accessible_by,
                 )
-                if accessible_by is not None:
-                    accessible_ids = select(SqlSessionPermission.conversation_id).where(
-                        SqlSessionPermission.workspace_id == current_workspace_id(),
-                        SqlSessionPermission.user_id == accessible_by,
-                    )
-                    stmt = stmt.where(SqlConversationLabel.conversation_id.in_(accessible_ids))
-                if owned_by is not None:
-                    owned_ids = select(SqlSessionPermission.conversation_id).where(
-                        SqlSessionPermission.workspace_id == current_workspace_id(),
-                        SqlSessionPermission.user_id == owned_by,
-                        SqlSessionPermission.level >= LEVEL_OWNER,
-                    )
-                    stmt = stmt.where(SqlConversationLabel.conversation_id.in_(owned_ids))
-                return [row[0] for row in session.execute(stmt).all()]
-        else:
-            # Split-DB: get non-archived IDs from Omnigent, filter labels in AP.
-            with self._session() as meta_sess:
-                non_archived_q = select(SqlConversationMetadata.id).where(
-                    SqlConversationMetadata.workspace_id == current_workspace_id(),
-                    SqlConversationMetadata.archived.is_(False),
+                non_archived_q = non_archived_q.where(
+                    SqlConversationMetadata.id.in_(accessible_ids)
                 )
-                if accessible_by is not None:
-                    accessible_ids = select(SqlSessionPermission.conversation_id).where(
-                        SqlSessionPermission.workspace_id == current_workspace_id(),
-                        SqlSessionPermission.user_id == accessible_by,
-                    )
-                    non_archived_q = non_archived_q.where(
-                        SqlConversationMetadata.id.in_(accessible_ids)
-                    )
-                if owned_by is not None:
-                    owned_ids = select(SqlSessionPermission.conversation_id).where(
-                        SqlSessionPermission.workspace_id == current_workspace_id(),
-                        SqlSessionPermission.user_id == owned_by,
-                        SqlSessionPermission.level >= LEVEL_OWNER,
-                    )
-                    non_archived_q = non_archived_q.where(
-                        SqlConversationMetadata.id.in_(owned_ids)
-                    )
-                non_archived_ids = list(meta_sess.execute(non_archived_q).scalars().all())
-            with self._conv_session() as ap_sess:
-                stmt = (
-                    select(SqlConversationLabel.value)
-                    .where(
-                        SqlConversationLabel.workspace_id == current_workspace_id(),
-                        SqlConversationLabel.key == PROJECT_LABEL_KEY,
-                        SqlConversationLabel.conversation_id.in_(non_archived_ids),
-                    )
-                    .distinct()
-                    .order_by(SqlConversationLabel.value)
+            if owned_by is not None:
+                owned_ids = select(SqlSessionPermission.conversation_id).where(
+                    SqlSessionPermission.workspace_id == current_workspace_id(),
+                    SqlSessionPermission.user_id == owned_by,
+                    SqlSessionPermission.level >= LEVEL_OWNER,
                 )
-                return [row[0] for row in ap_sess.execute(stmt).all()]
+                non_archived_q = non_archived_q.where(SqlConversationMetadata.id.in_(owned_ids))
+            non_archived_ids = list(meta_sess.execute(non_archived_q).scalars().all())
+        with self._conv_session() as ap_sess:
+            stmt = (
+                select(SqlConversationLabel.value)
+                .where(
+                    SqlConversationLabel.workspace_id == current_workspace_id(),
+                    SqlConversationLabel.key == PROJECT_LABEL_KEY,
+                    SqlConversationLabel.conversation_id.in_(non_archived_ids),
+                )
+                .distinct()
+                .order_by(SqlConversationLabel.value)
+            )
+            return [row[0] for row in ap_sess.execute(stmt).all()]
 
     def delete_label(
         self,
@@ -2058,8 +1945,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             or (owned_by is not None)
         )
 
-        if not self._same_db and needs_meta_filter:
-            # Split-DB: pre-fetch qualifying IDs from Omnigent DB.
+        qualifying_ids: list[str] | None = None
+        if needs_meta_filter:
+            # Pre-fetch qualifying IDs from Omnigent DB, then filter the AP query.
             with self._session() as meta_sess:
                 meta_q = select(SqlConversationMetadata.id).where(
                     SqlConversationMetadata.workspace_id == current_workspace_id()
@@ -2083,9 +1971,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                         SqlSessionPermission.level >= LEVEL_OWNER,
                     )
                     meta_q = meta_q.where(SqlConversationMetadata.id.in_(owned_ids))
-                qualifying_ids: list[str] | None = list(meta_sess.execute(meta_q).scalars().all())
-        else:
-            qualifying_ids = None
+                qualifying_ids = list(meta_sess.execute(meta_q).scalars().all())
 
         with self._conv_session() as session:
             stmt = select(SqlConversation).where(
@@ -2093,34 +1979,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
 
             if qualifying_ids is not None:
-                # Split-DB with meta filter: restrict to pre-fetched IDs.
                 stmt = stmt.where(SqlConversation.id.in_(qualifying_ids))
-            elif self._same_db and needs_meta_filter:
-                # Same-DB with meta filter: JOIN with metadata inline.
-                stmt = stmt.join(
-                    SqlConversationMetadata,
-                    (SqlConversationMetadata.workspace_id == SqlConversation.workspace_id)
-                    & (SqlConversationMetadata.id == SqlConversation.id),
-                )
-                if kind is not None:
-                    stmt = stmt.where(
-                        SqlConversationMetadata.kind == encode_conversation_kind(kind)
-                    )
-                if not include_archived:
-                    stmt = stmt.where(SqlConversationMetadata.archived.is_(False))
-                if accessible_by is not None:
-                    accessible_ids = select(SqlSessionPermission.conversation_id).where(
-                        SqlSessionPermission.workspace_id == current_workspace_id(),
-                        SqlSessionPermission.user_id == accessible_by,
-                    )
-                    stmt = stmt.where(SqlConversation.id.in_(accessible_ids))
-                if owned_by is not None:
-                    owned_ids = select(SqlSessionPermission.conversation_id).where(
-                        SqlSessionPermission.workspace_id == current_workspace_id(),
-                        SqlSessionPermission.user_id == owned_by,
-                        SqlSessionPermission.level >= LEVEL_OWNER,
-                    )
-                    stmt = stmt.where(SqlConversation.id.in_(owned_ids))
 
             if parent_conversation_id is not None:
                 stmt = stmt.where(
@@ -2133,27 +1992,19 @@ class SqlAlchemyConversationStore(ConversationStore):
             if has_agent_id is True:
                 stmt = stmt.where(SqlConversation.agent_id.is_not(None))
             if agent_name is not None:
-                if self._same_db:
-                    # Same-DB: SqlAgent is in the same DB; JOIN directly.
-                    stmt = stmt.join(SqlAgent, SqlAgent.id == SqlConversation.agent_id).where(
-                        SqlAgent.workspace_id == current_workspace_id(),
-                        SqlAgent.name == agent_name,
-                    )
-                else:
-                    # Split-DB: agents live in the Omnigent DB. Resolve to IDs
-                    # first, then filter the AP query by those IDs.
-                    with self._session() as agent_sess:
-                        agent_ids_for_name = list(
-                            agent_sess.execute(
-                                select(SqlAgent.id).where(
-                                    SqlAgent.workspace_id == current_workspace_id(),
-                                    SqlAgent.name == agent_name,
-                                )
+                # Agents live in the Omnigent DB — resolve to IDs first, then filter.
+                with self._session() as agent_sess:
+                    agent_ids_for_name = list(
+                        agent_sess.execute(
+                            select(SqlAgent.id).where(
+                                SqlAgent.workspace_id == current_workspace_id(),
+                                SqlAgent.name == agent_name,
                             )
-                            .scalars()
-                            .all()
                         )
-                    stmt = stmt.where(SqlConversation.agent_id.in_(agent_ids_for_name))
+                        .scalars()
+                        .all()
+                    )
+                stmt = stmt.where(SqlConversation.agent_id.in_(agent_ids_for_name))
             if agent_id is not None:
                 # Filter by the agent_id column on conversations directly
                 # (the tasks table has been removed). Conversations without
@@ -2235,39 +2086,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             snippets = (
                 _fetch_search_snippets(session, row_ids, search_query) if search_query else {}
             )
-            if self._same_db:
-                # Build entities inside the session to avoid DetachedInstanceError.
-                meta_rows = (
-                    (
-                        session.execute(
-                            select(SqlConversationMetadata).where(
-                                SqlConversationMetadata.workspace_id == current_workspace_id(),
-                                SqlConversationMetadata.id.in_(row_ids),
-                            )
-                        )
-                        .scalars()
-                        .all()
-                    )
-                    if row_ids
-                    else []
-                )
-                meta_by_id = {m.id: m for m in meta_rows}
-                convs = [
-                    _to_conversation(r, meta_by_id.get(r.id), labels_by_conv.get(r.id, {}))
-                    for r in rows
-                ]
-                for conv in convs:
-                    conv.search_snippet = snippets.get(conv.id)
-                return PagedList(
-                    data=convs,
-                    first_id=convs[0].id if convs else None,
-                    last_id=convs[-1].id if convs else None,
-                    has_more=has_more,
-                )
-            # Split-DB: build AP-only entities; metadata fetched separately below.
+            # Build AP-only entities; metadata fetched separately below.
             ap_entities = [(r, labels_by_conv.get(r.id, {})) for r in rows]
 
-        # Split-DB: fetch metadata from Omnigent DB and merge.
+        # Fetch metadata from Omnigent DB and merge.
         meta_by_id: dict[str, SqlConversationMetadata] = {}
         if row_ids:
             with self._session() as meta_sess:
@@ -2427,93 +2249,50 @@ class SqlAlchemyConversationStore(ConversationStore):
             if the conversation does not exist.
         """
         now = now_epoch()
-        if self._same_db:
-            with self._session() as session:
-                row = session.get(SqlConversation, (current_workspace_id(), conversation_id))
-                if not row:
-                    return None
-                meta = session.get(
-                    SqlConversationMetadata, (current_workspace_id(), conversation_id)
-                )
-                ap_changed = False
-                if title is not None:
-                    row.title = title or ""
-                    ap_changed = True
-                if _unset_reasoning_effort:
-                    row.reasoning_effort = None
-                    ap_changed = True
-                elif reasoning_effort is not None:
-                    row.reasoning_effort = reasoning_effort
-                    ap_changed = True
-                if _unset_model_override:
-                    row.model_override = None
-                    ap_changed = True
-                elif model_override is not None:
-                    row.model_override = model_override
-                    ap_changed = True
-                if _unset_cost_control_mode_override:
-                    row.cost_control_mode_override = None
-                    ap_changed = True
-                elif cost_control_mode_override is not None:
-                    row.cost_control_mode_override = cost_control_mode_override
-                    ap_changed = True
-                if harness_override is not None:
-                    row.harness_override = harness_override
-                    ap_changed = True
-                if meta is not None:
-                    if archived is not None:
-                        meta.archived = archived
-                        ap_changed = True  # archived is a visible state change
-                    if terminal_launch_args is not None:
-                        meta.terminal_launch_args = json.dumps(terminal_launch_args)
-                if ap_changed:
-                    row.updated_at = now
-                return _to_conversation(row, meta, _fetch_labels(session, conversation_id))
-        else:
-            # Split-DB: two separate transactions.
-            with self._conv_session() as ap_sess:
-                row = ap_sess.get(SqlConversation, (current_workspace_id(), conversation_id))
-                if not row:
-                    return None
-                ap_changed = False
-                if title is not None:
-                    row.title = title or ""
-                    ap_changed = True
-                if _unset_reasoning_effort:
-                    row.reasoning_effort = None
-                    ap_changed = True
-                elif reasoning_effort is not None:
-                    row.reasoning_effort = reasoning_effort
-                    ap_changed = True
-                if _unset_model_override:
-                    row.model_override = None
-                    ap_changed = True
-                elif model_override is not None:
-                    row.model_override = model_override
-                    ap_changed = True
-                if _unset_cost_control_mode_override:
-                    row.cost_control_mode_override = None
-                    ap_changed = True
-                elif cost_control_mode_override is not None:
-                    row.cost_control_mode_override = cost_control_mode_override
-                    ap_changed = True
-                if harness_override is not None:
-                    row.harness_override = harness_override
-                    ap_changed = True
+        # Two separate transactions: AP (conversation row) and Omnigent (metadata).
+        with self._conv_session() as ap_sess:
+            row = ap_sess.get(SqlConversation, (current_workspace_id(), conversation_id))
+            if not row:
+                return None
+            ap_changed = False
+            if title is not None:
+                row.title = title or ""
+                ap_changed = True
+            if _unset_reasoning_effort:
+                row.reasoning_effort = None
+                ap_changed = True
+            elif reasoning_effort is not None:
+                row.reasoning_effort = reasoning_effort
+                ap_changed = True
+            if _unset_model_override:
+                row.model_override = None
+                ap_changed = True
+            elif model_override is not None:
+                row.model_override = model_override
+                ap_changed = True
+            if _unset_cost_control_mode_override:
+                row.cost_control_mode_override = None
+                ap_changed = True
+            elif cost_control_mode_override is not None:
+                row.cost_control_mode_override = cost_control_mode_override
+                ap_changed = True
+            if harness_override is not None:
+                row.harness_override = harness_override
+                ap_changed = True
+            if archived is not None:
+                ap_changed = True  # archived is a visible state change
+            if ap_changed:
+                row.updated_at = now
+        with self._session() as meta_sess:
+            meta = meta_sess.get(
+                SqlConversationMetadata, (current_workspace_id(), conversation_id)
+            )
+            if meta is not None:
                 if archived is not None:
-                    ap_changed = True  # archived is a visible state change
-                if ap_changed:
-                    row.updated_at = now
-            with self._session() as meta_sess:
-                meta = meta_sess.get(
-                    SqlConversationMetadata, (current_workspace_id(), conversation_id)
-                )
-                if meta is not None:
-                    if archived is not None:
-                        meta.archived = archived
-                    if terminal_launch_args is not None:
-                        meta.terminal_launch_args = json.dumps(terminal_launch_args)
-            return self.get_conversation(conversation_id)
+                    meta.archived = archived
+                if terminal_launch_args is not None:
+                    meta.terminal_launch_args = json.dumps(terminal_launch_args)
+        return self.get_conversation(conversation_id)
 
     def set_runner_id(self, conversation_id: str, runner_id: str) -> bool:
         """
@@ -2574,16 +2353,6 @@ class SqlAlchemyConversationStore(ConversationStore):
                     f"conversation {conversation_id!r} does not exist",
                 )
             meta.runner_id = runner_id
-            if self._same_db:
-                ap_row = session.get(SqlConversation, (current_workspace_id(), conversation_id))
-                if ap_row is not None:
-                    ap_row.updated_at = now_epoch()
-                return _to_conversation(
-                    ap_row,  # type: ignore[arg-type]
-                    meta,
-                    _fetch_labels(session, conversation_id),
-                )
-        # Split-DB: bump updated_at on AP row then re-fetch full entity.
         with self._conv_session() as ap_sess:
             ap_row = ap_sess.get(SqlConversation, (current_workspace_id(), conversation_id))
             if ap_row is not None:
@@ -2612,16 +2381,6 @@ class SqlAlchemyConversationStore(ConversationStore):
                     f"conversation {conversation_id!r} does not exist",
                 )
             meta.runner_id = None
-            if self._same_db:
-                ap_row = session.get(SqlConversation, (current_workspace_id(), conversation_id))
-                if ap_row is not None:
-                    ap_row.updated_at = now_epoch()
-                return _to_conversation(
-                    ap_row,  # type: ignore[arg-type]
-                    meta,
-                    _fetch_labels(session, conversation_id),
-                )
-        # Split-DB: bump updated_at on AP row then re-fetch full entity.
         with self._conv_session() as ap_sess:
             ap_row = ap_sess.get(SqlConversation, (current_workspace_id(), conversation_id))
             if ap_row is not None:
@@ -2658,16 +2417,6 @@ class SqlAlchemyConversationStore(ConversationStore):
             meta.workspace = None
             meta.git_branch = None
             meta.runner_id = None
-            if self._same_db:
-                ap_row = session.get(SqlConversation, (current_workspace_id(), conversation_id))
-                if ap_row is not None:
-                    ap_row.updated_at = now_epoch()
-                return _to_conversation(
-                    ap_row,  # type: ignore[arg-type]
-                    meta,
-                    _fetch_labels(session, conversation_id),
-                )
-        # Split-DB: bump updated_at on AP row then re-fetch full entity.
         with self._conv_session() as ap_sess:
             ap_row = ap_sess.get(SqlConversation, (current_workspace_id(), conversation_id))
             if ap_row is not None:
@@ -2769,16 +2518,6 @@ class SqlAlchemyConversationStore(ConversationStore):
                 meta.workspace = workspace
             if git_branch is not None:
                 meta.git_branch = git_branch
-            if self._same_db:
-                ap_row = session.get(SqlConversation, (current_workspace_id(), conversation_id))
-                if ap_row is not None:
-                    ap_row.updated_at = now_epoch()
-                return _to_conversation(
-                    ap_row,  # type: ignore[arg-type]
-                    meta,
-                    _fetch_labels(session, conversation_id),
-                )
-        # Split-DB: bump updated_at on AP row then re-fetch full entity.
         with self._conv_session() as ap_sess:
             ap_row = ap_sess.get(SqlConversation, (current_workspace_id(), conversation_id))
             if ap_row is not None:
@@ -2829,16 +2568,6 @@ class SqlAlchemyConversationStore(ConversationStore):
             changed = existing != value
             if changed:
                 meta.external_session_id = value
-            if self._same_db:
-                ap_row = session.get(SqlConversation, (current_workspace_id(), conversation_id))
-                if changed and ap_row is not None:
-                    ap_row.updated_at = now_epoch()
-                return _to_conversation(
-                    ap_row,  # type: ignore[arg-type]
-                    meta,
-                    _fetch_labels(session, conversation_id),
-                )
-        # Split-DB: bump updated_at on AP row if changed, then re-fetch.
         if changed:
             with self._conv_session() as ap_sess:
                 ap_row = ap_sess.get(SqlConversation, (current_workspace_id(), conversation_id))
@@ -2923,105 +2652,55 @@ class SqlAlchemyConversationStore(ConversationStore):
         now = now_epoch()
         conversation_id = generate_conversation_id()
 
-        if self._same_db:
-            # Same DB: agent (Omnigent), conversation, labels (AP) share one session.
-            with self._session() as session:
-                root_conversation_id: str | None = None
-                if parent_conversation_id is not None:
-                    parent_row = session.get(
-                        SqlConversation, (current_workspace_id(), parent_conversation_id)
-                    )
-                    if parent_row is None:
-                        raise ConversationNotFoundError(
-                            f"parent conversation {parent_conversation_id!r} does not exist"
-                        )
-                    root_conversation_id = parent_row.root_conversation_id
-                conversation_row = _new_session_conversation_row(
-                    conversation_id,
-                    now,
-                    title,
-                    reasoning_effort,
-                    parent_conversation_id=parent_conversation_id,
-                    root_conversation_id=root_conversation_id,
-                )
-                session.add(conversation_row)
-                session.flush()
-
-                agent_row = _new_session_agent_row(
-                    agent_id=agent_id,
-                    agent_name=agent_name,
-                    agent_bundle_location=agent_bundle_location,
-                    agent_description=agent_description,
-                    now=now,
-                )
-                session.add(agent_row)
-                session.flush()
-
-                conversation_row.agent_id = agent_id
-                if labels:
-                    _upsert_labels(session, conversation_id, labels, now)
-
-                meta_row = _new_session_metadata_row(
-                    conversation_id,
-                    parent_conversation_id=parent_conversation_id,
-                    runner_id=runner_id,
-                    workspace=workspace,
-                    terminal_launch_args=terminal_launch_args,
-                )
-                session.add(meta_row)
-                session.flush()
-
-                return _created_session_from_rows(conversation_row, meta_row, agent_row, labels)
-        else:
-            # Split-DB: conversation + labels go to AP; agent + metadata go to Omnigent.
-            # Get parent root_id from AP first.
-            root_conversation_id = None
-            if parent_conversation_id is not None:
-                with self._conv_session() as ap_sess:
-                    parent_row = ap_sess.get(
-                        SqlConversation, (current_workspace_id(), parent_conversation_id)
-                    )
-                    if parent_row is None:
-                        raise ConversationNotFoundError(
-                            f"parent conversation {parent_conversation_id!r} does not exist"
-                        )
-                    root_conversation_id = parent_row.root_conversation_id
-
-            conversation_row = _new_session_conversation_row(
-                conversation_id,
-                now,
-                title,
-                reasoning_effort,
-                parent_conversation_id=parent_conversation_id,
-                root_conversation_id=root_conversation_id,
-            )
+        # Conversation + labels go to AP; agent + metadata go to Omnigent.
+        # Get parent root_id from AP first.
+        root_conversation_id: str | None = None
+        if parent_conversation_id is not None:
             with self._conv_session() as ap_sess:
-                ap_sess.add(conversation_row)
-                ap_sess.flush()
-                conversation_row.agent_id = agent_id
-                if labels:
-                    _upsert_labels(ap_sess, conversation_id, labels, now)
+                parent_row = ap_sess.get(
+                    SqlConversation, (current_workspace_id(), parent_conversation_id)
+                )
+                if parent_row is None:
+                    raise ConversationNotFoundError(
+                        f"parent conversation {parent_conversation_id!r} does not exist"
+                    )
+                root_conversation_id = parent_row.root_conversation_id
 
-            agent_row = _new_session_agent_row(
-                agent_id=agent_id,
-                agent_name=agent_name,
-                agent_bundle_location=agent_bundle_location,
-                agent_description=agent_description,
-                now=now,
-            )
-            meta_row = _new_session_metadata_row(
-                conversation_id,
-                parent_conversation_id=parent_conversation_id,
-                runner_id=runner_id,
-                workspace=workspace,
-                terminal_launch_args=terminal_launch_args,
-            )
-            with self._session() as session:
-                session.add(agent_row)
-                session.add(meta_row)
-                session.flush()
+        conversation_row = _new_session_conversation_row(
+            conversation_id,
+            now,
+            title,
+            reasoning_effort,
+            parent_conversation_id=parent_conversation_id,
+            root_conversation_id=root_conversation_id,
+        )
+        with self._conv_session() as ap_sess:
+            ap_sess.add(conversation_row)
+            ap_sess.flush()
+            conversation_row.agent_id = agent_id
+            if labels:
+                _upsert_labels(ap_sess, conversation_id, labels, now)
 
-            return _created_session_from_rows(conversation_row, meta_row, agent_row, labels)
+        agent_row = _new_session_agent_row(
+            agent_id=agent_id,
+            agent_name=agent_name,
+            agent_bundle_location=agent_bundle_location,
+            agent_description=agent_description,
+            now=now,
+        )
+        meta_row = _new_session_metadata_row(
+            conversation_id,
+            parent_conversation_id=parent_conversation_id,
+            runner_id=runner_id,
+            workspace=workspace,
+            terminal_launch_args=terminal_launch_args,
+        )
+        with self._session() as session:
+            session.add(agent_row)
+            session.add(meta_row)
+            session.flush()
+
+        return _created_session_from_rows(conversation_row, meta_row, agent_row, labels)
 
     def fork_conversation(
         self,
@@ -3127,26 +2806,17 @@ class SqlAlchemyConversationStore(ConversationStore):
         now = now_epoch()
         new_conv_id = generate_conversation_id()
 
-        # Fetch source metadata (workspace, external_session_id, terminal_launch_args).
-        # For same-DB, fetch inside the AP session below; for split-DB, fetch now.
-        if self._same_db:
-            source_meta_ref: SqlConversationMetadata | None = None  # fetched inside session below
-        else:
-            with self._session() as meta_sess:
-                source_meta_ref = meta_sess.get(
-                    SqlConversationMetadata, (current_workspace_id(), source_conversation_id)
-                )
+        # Fetch source metadata (workspace, external_session_id, terminal_launch_args)
+        # from the Omnigent DB before opening the AP session.
+        with self._session() as meta_sess:
+            source_meta_ref: SqlConversationMetadata | None = meta_sess.get(
+                SqlConversationMetadata, (current_workspace_id(), source_conversation_id)
+            )
 
         with self._conv_session() as session:
             source = session.get(SqlConversation, (current_workspace_id(), source_conversation_id))
             if source is None:
                 raise LookupError(f"conversation not found: {source_conversation_id!r}")
-
-            # For same-DB, fetch metadata inside this session.
-            if self._same_db:
-                source_meta_ref = session.get(
-                    SqlConversationMetadata, (current_workspace_id(), source_conversation_id)
-                )
 
             fork_title = (
                 title
@@ -3259,28 +2929,13 @@ class SqlAlchemyConversationStore(ConversationStore):
 
             # Create/bind the fork's session-scoped agent atomically.
             if creating_clone:
-                # Mint the clone atomically with the fork so it rolls back
-                # with the fork on failure — never leaking as a phantom built-in.
+                # The cloned agent is written to the Omnigent DB after the AP
+                # session commits (see the block below the with-statement).
                 assert (
                     agent_id is not None
                     and cloned_agent_name is not None
                     and cloned_agent_bundle_location is not None
                 )
-                if self._same_db:
-                    # Same-DB: add the agent in the current session so it
-                    # flushes alongside the conversation row.
-                    session.add(
-                        _new_session_agent_row(
-                            agent_id=agent_id,
-                            agent_name=cloned_agent_name,
-                            agent_bundle_location=cloned_agent_bundle_location,
-                            agent_description=cloned_agent_description,
-                            now=now,
-                        )
-                    )
-                    session.flush()
-                # For split-DB the agent is written to the Omnigent DB after the
-                # AP session commits (see the block below the with-statement).
                 new_conv.agent_id = agent_id
             elif agent_id is not None:
                 # Binding an existing (template) agent to the fork: the forward
@@ -3352,28 +3007,21 @@ class SqlAlchemyConversationStore(ConversationStore):
                 # Copy terminal args from source so the fork launches with same native args.
                 terminal_launch_args=source_terminal_args,
             )
-            if self._same_db:
-                session.add(fork_meta)
-                session.flush()
-            # For split-DB, fork_meta is committed in a separate session below.
 
-        if not self._same_db:
-            with self._session() as meta_sess:
-                meta_sess.add(fork_meta)
-                if creating_clone and agent_id is not None:
-                    # Split-DB: agents live in the Omnigent DB, not the AP DB.
-                    assert (
-                        cloned_agent_name is not None and cloned_agent_bundle_location is not None
+        # Write fork metadata (and cloned agent if any) to the Omnigent DB.
+        with self._session() as meta_sess:
+            meta_sess.add(fork_meta)
+            if creating_clone and agent_id is not None:
+                assert cloned_agent_name is not None and cloned_agent_bundle_location is not None
+                meta_sess.add(
+                    _new_session_agent_row(
+                        agent_id=agent_id,
+                        agent_name=cloned_agent_name,
+                        agent_bundle_location=cloned_agent_bundle_location,
+                        agent_description=cloned_agent_description,
+                        now=now,
                     )
-                    meta_sess.add(
-                        _new_session_agent_row(
-                            agent_id=agent_id,
-                            agent_name=cloned_agent_name,
-                            agent_bundle_location=cloned_agent_bundle_location,
-                            agent_description=cloned_agent_description,
-                            now=now,
-                        )
-                    )
+                )
 
         return _to_conversation(new_conv, fork_meta, fork_labels)
 
@@ -3434,119 +3082,59 @@ class SqlAlchemyConversationStore(ConversationStore):
         if previous_builtin_id is not None:
             upserts[SWITCH_PREVIOUS_BUILTIN_LABEL_KEY] = previous_builtin_id
 
-        if self._same_db:
-            with self._session() as session:
-                row = session.get(SqlConversation, (current_workspace_id(), conversation_id))
-                if row is None:
-                    raise LookupError(f"conversation not found: {conversation_id!r}")
+        # AP holds conversation+labels; Omnigent holds agent+metadata.
+        # Read old_agent_id from AP before overwriting it.
+        with self._conv_session() as ap_sess:
+            row = ap_sess.get(SqlConversation, (current_workspace_id(), conversation_id))
+            if row is None:
+                raise LookupError(f"conversation not found: {conversation_id!r}")
+            old_agent_id = row.agent_id
+            row.agent_id = new_agent_id
+            if not copy_model_settings:
+                row.model_override = None
+                row.reasoning_effort = None
+            row.harness_override = None
+            row.updated_at = now
 
-                # Null the forward pointer before deleting the old agent so
-                # SQLAlchemy's identity map doesn't hold a reference to a deleted
-                # row when it flushes. Only delete session-scoped agents.
-                old_agent_id = row.agent_id
-                row.agent_id = None
-                session.flush()
-                if old_agent_id is not None:
-                    old_agent = session.get(SqlAgent, (current_workspace_id(), old_agent_id))
-                    if old_agent is not None and old_agent.kind == encode_agent_kind("session"):
-                        session.delete(old_agent)
-                        session.flush()
+            existing = _fetch_labels(ap_sess, conversation_id)
+            present_drop = [key for key in drop_keys if key in existing]
+            if present_drop:
+                ap_sess.execute(
+                    delete(SqlConversationLabel).where(
+                        SqlConversationLabel.workspace_id == current_workspace_id(),
+                        SqlConversationLabel.conversation_id == conversation_id,
+                        SqlConversationLabel.key.in_(present_drop),
+                    )
+                )
+            if upserts:
+                _upsert_labels(ap_sess, conversation_id, upserts, now)
 
-                new_agent = _new_session_agent_row(
+        # Update agent + metadata on the Omnigent side.
+        with self._session() as session:
+            if old_agent_id is not None:
+                old_agent = session.get(SqlAgent, (current_workspace_id(), old_agent_id))
+                if old_agent is not None and old_agent.kind == encode_agent_kind("session"):
+                    session.delete(old_agent)
+                    session.flush()
+
+            session.add(
+                _new_session_agent_row(
                     agent_id=new_agent_id,
                     agent_name=new_agent_name,
                     agent_bundle_location=new_agent_bundle_location,
                     agent_description=new_agent_description,
                     now=now,
                 )
-                session.add(new_agent)
-                session.flush()
+            )
 
-                row.agent_id = new_agent_id
-                if not copy_model_settings:
-                    row.model_override = None
-                    row.reasoning_effort = None
-                row.harness_override = None
-                row.updated_at = now
+            meta = session.get(SqlConversationMetadata, (current_workspace_id(), conversation_id))
+            if meta is not None:
+                meta.external_session_id = None
 
-                # Clear external_session_id in metadata (same session for same-DB).
-                meta = session.get(
-                    SqlConversationMetadata, (current_workspace_id(), conversation_id)
-                )
-                if meta is not None:
-                    meta.external_session_id = None
-
-                # Replace the label set.
-                existing = _fetch_labels(session, conversation_id)
-                present_drop = [key for key in drop_keys if key in existing]
-                if present_drop:
-                    session.execute(
-                        delete(SqlConversationLabel).where(
-                            SqlConversationLabel.workspace_id == current_workspace_id(),
-                            SqlConversationLabel.conversation_id == conversation_id,
-                            SqlConversationLabel.key.in_(present_drop),
-                        )
-                    )
-                if upserts:
-                    _upsert_labels(session, conversation_id, upserts, now)
-
-                return _to_conversation(row, meta, _fetch_labels(session, conversation_id))
-        else:
-            # Split-DB: AP holds conversation+labels; Omnigent holds agent+metadata.
-            # Read old_agent_id from AP before overwriting it.
-            with self._conv_session() as ap_sess:
-                row = ap_sess.get(SqlConversation, (current_workspace_id(), conversation_id))
-                if row is None:
-                    raise LookupError(f"conversation not found: {conversation_id!r}")
-                old_agent_id = row.agent_id
-                row.agent_id = new_agent_id
-                if not copy_model_settings:
-                    row.model_override = None
-                    row.reasoning_effort = None
-                row.harness_override = None
-                row.updated_at = now
-
-                existing = _fetch_labels(ap_sess, conversation_id)
-                present_drop = [key for key in drop_keys if key in existing]
-                if present_drop:
-                    ap_sess.execute(
-                        delete(SqlConversationLabel).where(
-                            SqlConversationLabel.workspace_id == current_workspace_id(),
-                            SqlConversationLabel.conversation_id == conversation_id,
-                            SqlConversationLabel.key.in_(present_drop),
-                        )
-                    )
-                if upserts:
-                    _upsert_labels(ap_sess, conversation_id, upserts, now)
-
-            # Update agent + metadata on the Omnigent side.
-            with self._session() as session:
-                if old_agent_id is not None:
-                    old_agent = session.get(SqlAgent, (current_workspace_id(), old_agent_id))
-                    if old_agent is not None and old_agent.kind == encode_agent_kind("session"):
-                        session.delete(old_agent)
-                        session.flush()
-
-                session.add(
-                    _new_session_agent_row(
-                        agent_id=new_agent_id,
-                        agent_name=new_agent_name,
-                        agent_bundle_location=new_agent_bundle_location,
-                        agent_description=new_agent_description,
-                        now=now,
-                    )
-                )
-
-                meta = session.get(
-                    SqlConversationMetadata, (current_workspace_id(), conversation_id)
-                )
-                if meta is not None:
-                    meta.external_session_id = None
-
-            conv = self.get_conversation(conversation_id)
-            if conv is None:
-                raise LookupError(f"conversation not found: {conversation_id!r}")
-            return conv
+        conv = self.get_conversation(conversation_id)
+        if conv is None:
+            raise LookupError(f"conversation not found: {conversation_id!r}")
+        return conv
 
     async def delete_conversation(self, conversation_id: str) -> bool:
         """
@@ -3563,85 +3151,10 @@ class SqlAlchemyConversationStore(ConversationStore):
         :returns: ``True`` if the conversation existed,
             ``False`` otherwise.
         """
-        if self._same_db:
-            # Single-DB: run the entire delete in one transaction so that
-            # AP rows (items, labels, conversations) and Omnigent rows
-            # (comments, policies, permissions, metadata) are removed
-            # atomically — matching the behaviour before the table split.
-            with self._session() as session:
-                row = session.get(SqlConversation, (current_workspace_id(), conversation_id))
-                if not row:
-                    return False
-                cte = (
-                    select(SqlConversation.id)
-                    .where(
-                        SqlConversation.workspace_id == current_workspace_id(),
-                        SqlConversation.id == conversation_id,
-                    )
-                    .cte(name="subtree", recursive=True)
-                )
-                cte = cte.union_all(
-                    select(SqlConversation.id).where(
-                        SqlConversation.workspace_id == current_workspace_id(),
-                        SqlConversation.parent_conversation_id == cte.c.id,
-                    )
-                )
-                subtree_ids = [r[0] for r in session.execute(select(cte.c.id)).fetchall()]
-                for conv_id in subtree_ids:
-                    delete_fts_by_conversation(session, conv_id)
-                session.execute(
-                    delete(SqlConversationItem).where(
-                        SqlConversationItem.workspace_id == current_workspace_id(),
-                        SqlConversationItem.conversation_id.in_(subtree_ids),
-                    )
-                )
-                session.execute(
-                    delete(SqlConversationLabel).where(
-                        SqlConversationLabel.workspace_id == current_workspace_id(),
-                        SqlConversationLabel.conversation_id.in_(subtree_ids),
-                    )
-                )
-                session.execute(
-                    delete(SqlComment).where(
-                        SqlComment.workspace_id == current_workspace_id(),
-                        SqlComment.conversation_id.in_(subtree_ids),
-                    )
-                )
-                session.execute(
-                    delete(SqlPolicy).where(
-                        SqlPolicy.workspace_id == current_workspace_id(),
-                        SqlPolicy.session_id.in_(subtree_ids),
-                    )
-                )
-                session.execute(
-                    delete(SqlSessionPermission).where(
-                        SqlSessionPermission.workspace_id == current_workspace_id(),
-                        SqlSessionPermission.conversation_id.in_(subtree_ids),
-                    )
-                )
-                session.execute(
-                    delete(SqlConversationMetadata).where(
-                        SqlConversationMetadata.workspace_id == current_workspace_id(),
-                        SqlConversationMetadata.id.in_(subtree_ids),
-                    )
-                )
-                session.execute(
-                    delete(SqlConversation).where(
-                        SqlConversation.workspace_id == current_workspace_id(),
-                        SqlConversation.id.in_(subtree_ids),
-                        SqlConversation.id != conversation_id,
-                    )
-                )
-                session.delete(row)
-            return True
-
-        # Split-DB: AP rows and Omnigent rows are in different databases; two
-        # transactions are unavoidable. AP rows are deleted first so the
-        # conversation is immediately unreachable; Omnigent-side orphans
-        # (metadata/comments/policies/permissions) are cleaned up second.
-        # A failure of the second transaction leaves behind orphaned Omnigent
-        # rows for a conversation that no longer exists — an acceptable
-        # best-effort tradeoff documented in the split-DB design.
+        # AP rows are deleted first so the conversation is immediately unreachable;
+        # Omnigent-side rows (metadata/comments/policies/permissions) are cleaned up
+        # second. A failure of the second transaction leaves orphaned Omnigent rows
+        # for a conversation that no longer exists — an acceptable best-effort tradeoff.
         with self._conv_session() as ap_sess:
             row = ap_sess.get(SqlConversation, (current_workspace_id(), conversation_id))
             if not row:
