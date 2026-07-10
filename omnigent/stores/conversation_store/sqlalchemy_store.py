@@ -633,8 +633,11 @@ class SqlAlchemyConversationStore(ConversationStore):
                 self._conv_engine, immediate=True
             )
 
-        # Use the AP engine for dialect checks since conversations/items live there.
+        # Dialect-appropriate row-locking flags. Each flag is derived from its
+        # own engine so a mixed-dialect split-DB (e.g. Postgres AP + SQLite
+        # Omnigent) gets the correct lock strategy for each table group.
         self._supports_for_update = self._conv_engine.dialect.name != "sqlite"
+        self._meta_supports_for_update = self._engine.dialect.name != "sqlite"
         # SQLite rowid is monotonically increasing absent deletions; it serves
         # as an insertion-ordered tiebreaker for timestamp ties. Note: without
         # the AUTOINCREMENT keyword, SQLite may reuse a rowid if the max-rowid
@@ -1263,7 +1266,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 SqlConversationMetadata.workspace_id == current_workspace_id(),
                 SqlConversationMetadata.id == conversation_id,
             )
-            if self._supports_for_update:
+            if self._meta_supports_for_update:
                 q = q.with_for_update()
             meta = session.scalars(q).first()
             current: dict[str, Any] = (
@@ -2130,10 +2133,27 @@ class SqlAlchemyConversationStore(ConversationStore):
             if has_agent_id is True:
                 stmt = stmt.where(SqlConversation.agent_id.is_not(None))
             if agent_name is not None:
-                stmt = stmt.join(SqlAgent, SqlAgent.id == SqlConversation.agent_id).where(
-                    SqlAgent.workspace_id == current_workspace_id(),
-                    SqlAgent.name == agent_name,
-                )
+                if self._same_db:
+                    # Same-DB: SqlAgent is in the same DB; JOIN directly.
+                    stmt = stmt.join(SqlAgent, SqlAgent.id == SqlConversation.agent_id).where(
+                        SqlAgent.workspace_id == current_workspace_id(),
+                        SqlAgent.name == agent_name,
+                    )
+                else:
+                    # Split-DB: agents live in the Omnigent DB. Resolve to IDs
+                    # first, then filter the AP query by those IDs.
+                    with self._session() as agent_sess:
+                        agent_ids_for_name = list(
+                            agent_sess.execute(
+                                select(SqlAgent.id).where(
+                                    SqlAgent.workspace_id == current_workspace_id(),
+                                    SqlAgent.name == agent_name,
+                                )
+                            )
+                            .scalars()
+                            .all()
+                        )
+                    stmt = stmt.where(SqlConversation.agent_id.in_(agent_ids_for_name))
             if agent_id is not None:
                 # Filter by the agent_id column on conversations directly
                 # (the tasks table has been removed). Conversations without
@@ -3246,16 +3266,21 @@ class SqlAlchemyConversationStore(ConversationStore):
                     and cloned_agent_name is not None
                     and cloned_agent_bundle_location is not None
                 )
-                session.add(
-                    _new_session_agent_row(
-                        agent_id=agent_id,
-                        agent_name=cloned_agent_name,
-                        agent_bundle_location=cloned_agent_bundle_location,
-                        agent_description=cloned_agent_description,
-                        now=now,
+                if self._same_db:
+                    # Same-DB: add the agent in the current session so it
+                    # flushes alongside the conversation row.
+                    session.add(
+                        _new_session_agent_row(
+                            agent_id=agent_id,
+                            agent_name=cloned_agent_name,
+                            agent_bundle_location=cloned_agent_bundle_location,
+                            agent_description=cloned_agent_description,
+                            now=now,
+                        )
                     )
-                )
-                session.flush()
+                    session.flush()
+                # For split-DB the agent is written to the Omnigent DB after the
+                # AP session commits (see the block below the with-statement).
                 new_conv.agent_id = agent_id
             elif agent_id is not None:
                 # Binding an existing (template) agent to the fork: the forward
@@ -3333,12 +3358,22 @@ class SqlAlchemyConversationStore(ConversationStore):
             # For split-DB, fork_meta is committed in a separate session below.
 
         if not self._same_db:
-            if creating_clone and agent_id is not None:
-                # Agent row was added to AP session (same-DB only above); for split-DB
-                # the agent must go into the Omnigent session.
-                pass  # agent was already added to the AP session in creating_clone block above
             with self._session() as meta_sess:
                 meta_sess.add(fork_meta)
+                if creating_clone and agent_id is not None:
+                    # Split-DB: agents live in the Omnigent DB, not the AP DB.
+                    assert (
+                        cloned_agent_name is not None and cloned_agent_bundle_location is not None
+                    )
+                    meta_sess.add(
+                        _new_session_agent_row(
+                            agent_id=agent_id,
+                            agent_name=cloned_agent_name,
+                            agent_bundle_location=cloned_agent_bundle_location,
+                            agent_description=cloned_agent_description,
+                            now=now,
+                        )
+                    )
 
         return _to_conversation(new_conv, fork_meta, fork_labels)
 
