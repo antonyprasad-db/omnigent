@@ -92,9 +92,7 @@ def upgrade() -> None:
     # Use batch_alter_table for SQLite compatibility.
     with op.batch_alter_table("conversations") as batch_op:
         batch_op.drop_constraint("ck_conversations_kind", type_="check")
-        batch_op.drop_constraint(
-            "ck_conversations_workspace_required_for_host", type_="check"
-        )
+        batch_op.drop_constraint("ck_conversations_workspace_required_for_host", type_="check")
         # 5. Drop the metadata columns from conversations.
         batch_op.drop_column("kind")
         batch_op.drop_column("runner_id")
@@ -116,14 +114,10 @@ def downgrade() -> None:
         batch_op.add_column(sa.Column("runner_id", sa.String(64), nullable=True))
         batch_op.add_column(sa.Column("host_id", sa.String(64), nullable=True))
         batch_op.add_column(sa.Column("sub_agent_name", sa.String(128), nullable=True))
-        batch_op.add_column(
-            sa.Column("external_session_id", sa.String(128), nullable=True)
-        )
+        batch_op.add_column(sa.Column("external_session_id", sa.String(128), nullable=True))
         batch_op.add_column(sa.Column("session_state", sa.LargeBinary(), nullable=True))
         batch_op.add_column(sa.Column("session_usage", sa.LargeBinary(), nullable=True))
-        batch_op.add_column(
-            sa.Column("terminal_launch_args", sa.LargeBinary(), nullable=True)
-        )
+        batch_op.add_column(sa.Column("terminal_launch_args", sa.LargeBinary(), nullable=True))
         batch_op.add_column(sa.Column("workspace", sa.String(2048), nullable=True))
         batch_op.add_column(sa.Column("git_branch", sa.String(255), nullable=True))
         batch_op.add_column(
@@ -158,9 +152,16 @@ def downgrade() -> None:
         """
     )
     for col in (
-        "runner_id", "host_id", "sub_agent_name",
-        "external_session_id", "session_state", "session_usage",
-        "terminal_launch_args", "workspace", "git_branch", "archived",
+        "runner_id",
+        "host_id",
+        "sub_agent_name",
+        "external_session_id",
+        "session_state",
+        "session_usage",
+        "terminal_launch_args",
+        "workspace",
+        "git_branch",
+        "archived",
     ):
         op.execute(
             f"""
@@ -187,6 +188,8 @@ def downgrade() -> None:
     )
 
     # 4. Drop the metadata table.
-    op.drop_index("ix_conversation_metadata_runner_id", table_name="omnigent_conversation_metadata")
+    op.drop_index(
+        "ix_conversation_metadata_runner_id", table_name="omnigent_conversation_metadata"
+    )
     op.drop_index("ix_conversation_metadata_kind", table_name="omnigent_conversation_metadata")
     op.drop_table("omnigent_conversation_metadata")

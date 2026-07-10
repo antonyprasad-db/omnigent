@@ -2440,13 +2440,14 @@ class SqlAlchemyConversationStore(ConversationStore):
                 if harness_override is not None:
                     row.harness_override = harness_override
                     ap_changed = True
-                if ap_changed:
-                    row.updated_at = now
                 if meta is not None:
                     if archived is not None:
                         meta.archived = archived
+                        ap_changed = True  # archived is a visible state change
                     if terminal_launch_args is not None:
                         meta.terminal_launch_args = json.dumps(terminal_launch_args)
+                if ap_changed:
+                    row.updated_at = now
                 return _to_conversation(row, meta, _fetch_labels(session, conversation_id))
         else:
             # Split-DB: two separate transactions.
@@ -2479,6 +2480,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                 if harness_override is not None:
                     row.harness_override = harness_override
                     ap_changed = True
+                if archived is not None:
+                    ap_changed = True  # archived is a visible state change
                 if ap_changed:
                     row.updated_at = now
             with self._session() as meta_sess:
