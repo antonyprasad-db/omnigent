@@ -315,6 +315,45 @@ def get_or_create_engine(db_uri: str) -> Engine:
     return _engine_cache[db_uri]
 
 
+def get_or_create_conversation_engine(conv_uri: str) -> Engine:
+    """
+    Return a cached engine for the Agent Platform DB URI.
+
+    Unlike :func:`get_or_create_engine`, this does NOT run Alembic
+    migrations — the AP DB is expected to be a fresh database that
+    gets its tables created via ``Base.metadata.create_all()``.
+    For the common case where AP DB == Omnigent DB, callers should
+    use :func:`get_or_create_engine` directly and share the engine.
+
+    :param conv_uri: SQLAlchemy database URI for the AP DB.
+    :returns: A :class:`~sqlalchemy.engine.Engine` for the given URI.
+    """
+    if conv_uri not in _engine_cache:
+        with _engine_lock:
+            if conv_uri not in _engine_cache:
+                engine = _create_engine(conv_uri)
+                _ensure_conversation_tables(engine)
+                from omnigent.runtime.telemetry import instrument_sqlalchemy_engine
+
+                instrument_sqlalchemy_engine(engine)
+                _engine_cache[conv_uri] = engine
+    return _engine_cache[conv_uri]
+
+
+def _ensure_conversation_tables(engine: Engine) -> None:
+    """Create AP tables (conversations, conversation_items, conversation_labels) if absent."""
+    from omnigent.db.db_models import (
+        SqlConversation,
+        SqlConversationItem,
+        SqlConversationLabel,
+    )
+
+    SqlConversation.__table__.create(bind=engine, checkfirst=True)
+    SqlConversationItem.__table__.create(bind=engine, checkfirst=True)
+    SqlConversationLabel.__table__.create(bind=engine, checkfirst=True)
+    ensure_fts_table(engine)
+
+
 def _build_alembic_config(db_uri: str) -> Config:
     """
     Build an Alembic ``Config`` pointed at our migrations directory.
@@ -529,7 +568,14 @@ def make_managed_session_maker(
     :returns: A callable that, when invoked, returns a context
         manager yielding a :class:`~sqlalchemy.orm.Session`.
     """
-    factory = sessionmaker(bind=engine)
+    # expire_on_commit=False keeps column attributes accessible on ORM
+    # instances after the session commits and closes. Without it, SQLAlchemy
+    # expires all attributes on commit, and any access outside the session
+    # context (e.g. after the ``with session:`` block exits) raises
+    # DetachedInstanceError. This is safe here because each managed session
+    # is short-lived and single-writer, so there is no cross-session stale
+    # data concern.
+    factory = sessionmaker(bind=engine, expire_on_commit=False)
     is_sqlite = engine.dialect.name == "sqlite"
 
     @contextmanager

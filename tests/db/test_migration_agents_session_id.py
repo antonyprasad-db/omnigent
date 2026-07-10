@@ -114,11 +114,12 @@ def test_agents_session_id_fk_accepts_existing_session(db_engine: Engine) -> Non
             ),
             {"id": "ag_bound", "ts": 1700000001, "name": "bound-agent", "loc": "ag_bound/bundle"},
         )
+        # kind is now on omnigent_conversation_metadata, not conversations.
         conn.execute(
             sa.text(
                 "INSERT INTO conversations"
-                " (id, created_at, updated_at, root_conversation_id, kind, agent_id)"
-                " VALUES (:id, :ts, :ts, :id, 1, :agent_id)"
+                " (id, created_at, updated_at, root_conversation_id, agent_id)"
+                " VALUES (:id, :ts, :ts, :id, :agent_id)"
             ),
             {"id": "conv_bound", "ts": 1700000002, "agent_id": "ag_bound"},
         )
@@ -136,11 +137,12 @@ def test_agents_session_id_fk_rejects_missing_session(db_engine: Engine) -> None
     """
     # No IntegrityError expected — FK has been removed.
     with db_engine.begin() as conn:
+        # kind is now on omnigent_conversation_metadata, not conversations.
         conn.execute(
             sa.text(
                 "INSERT INTO conversations"
-                " (id, created_at, updated_at, root_conversation_id, kind, agent_id)"
-                " VALUES (:id, :ts, :ts, :id, 1, :agent_id)"
+                " (id, created_at, updated_at, root_conversation_id, agent_id)"
+                " VALUES (:id, :ts, :ts, :id, :agent_id)"
             ),
             {"id": "conv_missing", "ts": 1700000002, "agent_id": "ag_nonexistent"},
         )
@@ -303,8 +305,18 @@ def test_agents_session_id_downgrade_round_trip(tmp_path: Path) -> None:
             sa.text(
                 "INSERT INTO conversations"
                 " (workspace_id, id, created_at, updated_at, root_conversation_id,"
-                "  kind, agent_id, title)"
-                " VALUES (0, 'conv_1', 3, 3, 'conv_1', 1, 'ag_sess', '')"
+                "  agent_id, title)"
+                " VALUES (0, 'conv_1', 3, 3, 'conv_1', 'ag_sess', '')"
+            )
+        )
+        # kind lives on omnigent_conversation_metadata at head; insert a
+        # matching row so the aa1b2c3d4e5f downgrade can restore kind to
+        # conversations without leaving a NULL (which would break u1 downgrade).
+        conn.execute(
+            sa.text(
+                "INSERT INTO omnigent_conversation_metadata"
+                " (workspace_id, id, kind)"
+                " VALUES (0, 'conv_1', 1)"
             )
         )
 
