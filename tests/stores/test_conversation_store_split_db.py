@@ -55,7 +55,12 @@ def _col(db: Path, table: str, col: str, where: str = "") -> list:
 # ── Table placement ────────────────────────────────────
 
 
-def test_tables_live_in_correct_db(omnigent_db: Path, conv_db: Path, store: SqlAlchemyConversationStore) -> None:
+def test_tables_live_in_correct_db(
+    omnigent_db: Path,
+    conv_db: Path,
+    store: SqlAlchemyConversationStore,  # triggers DB init
+) -> None:
+    del store  # only used to initialise both databases
     omnigent_tables = _tables(omnigent_db)
     conv_tables = _tables(conv_db)
 
@@ -77,7 +82,7 @@ def test_tables_live_in_correct_db(omnigent_db: Path, conv_db: Path, store: SqlA
 def test_create_conversation_rows_land_in_correct_db(
     omnigent_db: Path, conv_db: Path, store: SqlAlchemyConversationStore
 ) -> None:
-    conv = store.create_conversation(
+    store.create_conversation(
         kind="default",
         title="hello",
         runner_id="runner_abc",
@@ -108,9 +113,11 @@ def test_create_sub_agent_conversation(
     assert child.kind == "sub_agent"
     assert child.parent_conversation_id == parent.id
     # kind lives in metadata
-    assert _col(omnigent_db, "omnigent_conversation_metadata", "kind", f"id='{child.id}'") == [2]
+    kind_code = _col(omnigent_db, "omnigent_conversation_metadata", "kind", f"id='{child.id}'")
+    assert kind_code == [2]
     # title and parent link live in AP
-    assert _col(conv_db, "conversations", "parent_conversation_id", f"id='{child.id}'") == [parent.id]
+    parent_id_col = _col(conv_db, "conversations", "parent_conversation_id", f"id='{child.id}'")
+    assert parent_id_col == [parent.id]
 
 
 # ── get / list ─────────────────────────────────────────
@@ -137,9 +144,7 @@ def test_get_conversations_bulk(store: SqlAlchemyConversationStore) -> None:
 def test_list_conversations_kind_filter_crosses_dbs(store: SqlAlchemyConversationStore) -> None:
     store.create_conversation(kind="default", title="top")
     parent = store.create_conversation(kind="default", title="parent2")
-    store.create_conversation(
-        kind="sub_agent", title="child", parent_conversation_id=parent.id
-    )
+    store.create_conversation(kind="sub_agent", title="child", parent_conversation_id=parent.id)
 
     defaults = store.list_conversations(kind="default")
     subs = store.list_conversations(kind="sub_agent")
@@ -160,9 +165,7 @@ def test_list_conversations_archived_filter(store: SqlAlchemyConversationStore) 
 # ── labels ─────────────────────────────────────────────
 
 
-def test_labels_land_in_conv_db(
-    conv_db: Path, store: SqlAlchemyConversationStore
-) -> None:
+def test_labels_land_in_conv_db(conv_db: Path, store: SqlAlchemyConversationStore) -> None:
     conv = store.create_conversation(title="labeled")
     store.set_labels(conv.id, {"env": "test", "owner": "alice"})
 
@@ -187,7 +190,10 @@ def test_set_runner_id_lands_in_omnigent_db(
 ) -> None:
     conv = store.create_conversation(title="runner")
     store.set_runner_id(conv.id, "runner_xyz")
-    assert _col(omnigent_db, "omnigent_conversation_metadata", "runner_id", f"id='{conv.id}'") == ["runner_xyz"]
+    runner_ids = _col(
+        omnigent_db, "omnigent_conversation_metadata", "runner_id", f"id='{conv.id}'"
+    )
+    assert runner_ids == ["runner_xyz"]
 
 
 def test_set_session_state_lands_in_omnigent_db(
@@ -276,9 +282,7 @@ def test_delete_conversation_subtree_cleans_both_dbs(
     omnigent_db: Path, conv_db: Path, store: SqlAlchemyConversationStore
 ) -> None:
     parent = store.create_conversation(title="parent")
-    child = store.create_conversation(
-        kind="sub_agent", title="child", parent_conversation_id=parent.id
-    )
+    store.create_conversation(kind="sub_agent", title="child", parent_conversation_id=parent.id)
     assert _count(conv_db, "conversations") == 2
     assert _count(omnigent_db, "omnigent_conversation_metadata") == 2
 
@@ -323,7 +327,9 @@ def test_fork_conversation_copies_to_both_dbs(
             NewConversationItem(
                 type="message",
                 response_id="resp_1",
-                data=MessageData(role="user", content=[{"type": "input_text", "text": "original"}]),
+                data=MessageData(
+                    role="user", content=[{"type": "input_text", "text": "original"}]
+                ),
             )
         ],
     )
