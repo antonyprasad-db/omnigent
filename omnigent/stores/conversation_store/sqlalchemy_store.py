@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 from sqlalchemy import (
@@ -80,6 +81,8 @@ from omnigent.stores.conversation_store import (
     CreatedSession,
     SessionConnectivity,
 )
+
+_logger = logging.getLogger(__name__)
 
 
 def _to_conversation(
@@ -2283,11 +2286,26 @@ class SqlAlchemyConversationStore(ConversationStore):
                 ap_changed = True  # archived is a visible state change
             if ap_changed:
                 row.updated_at = now
-        with self._session() as meta_sess:
-            meta = meta_sess.get(
-                SqlConversationMetadata, (current_workspace_id(), conversation_id)
-            )
-            if meta is not None:
+        if archived is not None or terminal_launch_args is not None:
+            with self._session() as meta_sess:
+                meta = meta_sess.get(
+                    SqlConversationMetadata, (current_workspace_id(), conversation_id)
+                )
+                if meta is None:
+                    # Orphaned conversation (a crash between the AP and
+                    # metadata transactions during creation left no metadata
+                    # row). Recreate it rather than silently dropping the
+                    # update; kind derives from the parent pointer, same as
+                    # at creation.
+                    _logger.warning(
+                        "conversation %s has no metadata row; recreating it",
+                        conversation_id,
+                    )
+                    meta = _new_session_metadata_row(
+                        conversation_id,
+                        parent_conversation_id=row.parent_conversation_id,
+                    )
+                    meta_sess.add(meta)
                 if archived is not None:
                     meta.archived = archived
                 if terminal_launch_args is not None:

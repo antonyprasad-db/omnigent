@@ -381,3 +381,48 @@ def test_agent_store_resolves_session_id_across_dbs(
     updated = agent_store.update("ag_split_1", "ag_split_1/bundle2")
     assert updated is not None
     assert updated.session_id == created.conversation.id
+
+
+# ── Orphan repair: update with a missing metadata row ─────────────────
+
+
+def test_update_conversation_repairs_missing_metadata(
+    omnigent_db: Path,
+    conv_db: Path,
+    store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    A crash between the AP and metadata transactions during creation
+    leaves a conversation with no metadata row. An archive update must
+    recreate the row (deriving ``kind`` from the parent pointer) rather
+    than silently dropping the write and reporting ``archived=False``.
+    """
+    parent = store.create_conversation(title="orphan parent")
+    child = store.create_conversation(
+        kind="sub_agent",
+        title="orphan child",
+        parent_conversation_id=parent.id,
+    )
+    # Simulate the creation crash: drop both metadata rows directly.
+    with sqlite3.connect(str(omnigent_db)) as conn:
+        conn.execute(
+            "DELETE FROM omnigent_conversation_metadata WHERE id IN (?, ?)",
+            (parent.id, child.id),
+        )
+        conn.commit()
+    assert _count(omnigent_db, "omnigent_conversation_metadata") == 0
+
+    updated = store.update_conversation(parent.id, archived=True)
+    assert updated is not None
+    assert updated.archived is True
+
+    child_updated = store.update_conversation(child.id, archived=True)
+    assert child_updated is not None
+    assert child_updated.archived is True
+    # kind is rederived from the parent pointer during repair.
+    assert child_updated.kind == "sub_agent"
+
+    # Both metadata rows were recreated in the Omnigent DB.
+    assert sorted(_col(omnigent_db, "omnigent_conversation_metadata", "id")) == sorted(
+        [parent.id, child.id]
+    )
