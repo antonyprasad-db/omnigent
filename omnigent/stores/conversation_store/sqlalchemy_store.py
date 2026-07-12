@@ -28,6 +28,7 @@ from omnigent.db.converters import sql_agent_to_entity
 from omnigent.db.db_models import (
     LABEL_VALUE_MAX_LEN,
     SqlAgent,
+    SqlAgentConfiguration,
     SqlComment,
     SqlConversation,
     SqlConversationItem,
@@ -89,10 +90,11 @@ def _to_conversation(
     row: SqlConversation,
     meta: SqlConversationMetadata | None = None,
     labels: dict[str, str] | None = None,
+    agent_config: SqlAgentConfiguration | None = None,
 ) -> Conversation:
     """
-    Convert a :class:`SqlConversation` ORM row (plus optional metadata)
-    to a :class:`Conversation` entity.
+    Convert a :class:`SqlConversation` ORM row (plus optional metadata
+    and agent-configuration rows) to a :class:`Conversation` entity.
 
     :param row: The SQLAlchemy ORM row to convert.
     :param meta: Optional metadata row from
@@ -105,6 +107,9 @@ def _to_conversation(
         ``None`` rather than forcing a second query); this
         maps to an empty dict on the entity. Populated
         callers pass the JOINed ``{key: value}`` map.
+    :param agent_config: Optional paired row from ``agent_configuration``.
+        When ``None``, the agent binding and all per-session
+        overrides default to ``None``.
     :returns: A :class:`Conversation` dataclass instance.
     """
     import json
@@ -115,6 +120,7 @@ def _to_conversation(
     session_usage: dict[str, Any] = {}
     if meta and meta.session_usage:
         session_usage = json.loads(meta.session_usage)
+    agent_config = agent_config
     return Conversation(
         id=row.id,
         created_at=row.created_at,
@@ -123,16 +129,18 @@ def _to_conversation(
         kind=decode_conversation_kind(meta.kind) if meta else "default",
         parent_conversation_id=row.parent_conversation_id,
         root_conversation_id=row.root_conversation_id,
-        agent_id=row.agent_id,
+        agent_id=agent_config.agent_id if agent_config else None,
         runner_id=meta.runner_id if meta else None,
         host_id=meta.host_id if meta else None,
         labels=labels if labels is not None else {},
         session_state=session_state,
         session_usage=session_usage,
-        reasoning_effort=row.reasoning_effort,
-        model_override=row.model_override,
-        cost_control_mode_override=row.cost_control_mode_override,
-        harness_override=row.harness_override,
+        reasoning_effort=agent_config.reasoning_effort if agent_config else None,
+        model_override=agent_config.model_override if agent_config else None,
+        cost_control_mode_override=agent_config.cost_control_mode_override
+        if agent_config
+        else None,
+        harness_override=agent_config.harness_override if agent_config else None,
         sub_agent_name=meta.sub_agent_name if meta else None,
         external_session_id=meta.external_session_id if meta else None,
         # NULL → None; a stored JSON array (e.g. ``"[]"`` or
@@ -154,24 +162,21 @@ def _new_session_conversation_row(
     conversation_id: str,
     now: int,
     title: str | None,
-    reasoning_effort: str | None,
     parent_conversation_id: str | None = None,
     root_conversation_id: str | None = None,
 ) -> SqlConversation:
     """
     Build the AP conversation row for atomic session creation.
 
-    Omnigent operational fields (runner_id, host_id, workspace,
-    terminal_launch_args, kind, etc.) live in the paired
-    :func:`_new_session_metadata_row` instead.
+    The agent binding and per-session overrides live in the paired
+    :func:`_new_agent_configuration_row`; Omnigent operational fields
+    (runner_id, host_id, workspace, terminal_launch_args, kind, etc.)
+    in :func:`_new_session_metadata_row`.
 
     :param conversation_id: New conversation id, e.g.
         ``"conv_abc123"``.
     :param now: Unix epoch seconds used for created/updated fields.
     :param title: Optional session title.
-    :param reasoning_effort: Optional per-session reasoning-effort
-        hint, e.g. ``"high"``. ``None`` means use the agent
-        default.
     :param parent_conversation_id: Optional parent conversation id,
         e.g. ``"conv_parent1"``. ``None`` creates a top-level row.
     :param root_conversation_id: Root of the spawn tree. Required
@@ -193,8 +198,38 @@ def _new_session_conversation_row(
         # primary key so tree-scoped lookups treat it as its own
         # root. Child rows inherit their parent's root.
         root_conversation_id=root_conversation_id or conversation_id,
-        agent_id=None,
+    )
+
+
+def _new_agent_configuration_row(
+    conversation_id: str,
+    agent_id: str | None = None,
+    reasoning_effort: str | None = None,
+    model_override: str | None = None,
+    cost_control_mode_override: str | None = None,
+    harness_override: str | None = None,
+) -> SqlAgentConfiguration:
+    """
+    Build the agent-configuration row paired with a new conversation.
+
+    Lives on the Conversation base, so callers add it in the same
+    transaction as the :class:`SqlConversation` row.
+
+    :param conversation_id: New conversation id, e.g. ``"conv_abc123"``.
+    :param agent_id: Optional agent binding. ``None`` leaves it NULL.
+    :param reasoning_effort: Optional per-session reasoning-effort hint.
+    :param model_override: Optional per-session LLM model override.
+    :param cost_control_mode_override: Optional cost-control switch.
+    :param harness_override: Optional brain-harness override.
+    :returns: Unsaved :class:`SqlAgentConfiguration` row.
+    """
+    return SqlAgentConfiguration(
+        conversation_id=conversation_id,
+        agent_id=agent_id,
         reasoning_effort=reasoning_effort,
+        model_override=model_override,
+        cost_control_mode_override=cost_control_mode_override,
+        harness_override=harness_override,
     )
 
 
@@ -263,6 +298,7 @@ def _new_session_agent_row(
 def _created_session_from_rows(
     conversation_row: SqlConversation,
     meta_row: SqlConversationMetadata | None,
+    agent_config_row: SqlAgentConfiguration | None,
     agent_row: SqlAgent,
     labels: dict[str, str] | None,
 ) -> CreatedSession:
@@ -272,6 +308,8 @@ def _created_session_from_rows(
     :param conversation_row: Inserted conversation row.
     :param meta_row: Inserted metadata row, or ``None`` when not yet
         persisted (entity defaults apply).
+    :param agent_config_row: Inserted agent-configuration row, or ``None``
+        when not yet persisted (entity defaults apply).
     :param agent_row: Inserted session-scoped agent row.
     :param labels: Labels written during creation, or ``None``.
     :returns: :class:`CreatedSession` with entity objects.
@@ -281,6 +319,7 @@ def _created_session_from_rows(
             conversation_row,
             meta_row,
             labels if labels is not None else {},
+            agent_config_row,
         ),
         agent=sql_agent_to_entity(agent_row, session_id=conversation_row.id),
     )
@@ -664,6 +703,31 @@ class SqlAlchemyConversationStore(ConversationStore):
                 SqlConversationMetadata, (current_workspace_id(), conversation_id)
             )
 
+    @staticmethod
+    def _fetch_agent_configurations(
+        session: Session, conversation_ids: list[str]
+    ) -> dict[str, SqlAgentConfiguration]:
+        """
+        Bulk-fetch agent-configuration rows keyed by conversation id.
+
+        Runs on the caller's Conversation-DB session (``agent_configuration``
+        is on the Conversation base), so callers batch it beside the
+        conversation-row and label fetches in one snapshot.
+        """
+        if not conversation_ids:
+            return {}
+        rows = (
+            session.execute(
+                select(SqlAgentConfiguration).where(
+                    SqlAgentConfiguration.workspace_id == current_workspace_id(),
+                    SqlAgentConfiguration.conversation_id.in_(conversation_ids),
+                )
+            )
+            .scalars()
+            .all()
+        )
+        return {r.conversation_id: r for r in rows}
+
     def _lock_conversation(self, session: Session, conversation_id: str) -> None:
         """
         Acquire a row-level lock on the conversation to serialize
@@ -817,9 +881,11 @@ class SqlAlchemyConversationStore(ConversationStore):
                     title=title or "",
                     parent_conversation_id=parent_conversation_id,
                     root_conversation_id=root_id,
-                    agent_id=agent_id,
                 )
                 ap_sess.add(row)
+                # Same DB as conversations, so the pair commits atomically.
+                agent_config = _new_agent_configuration_row(new_id, agent_id=agent_id)
+                ap_sess.add(agent_config)
             meta = SqlConversationMetadata(
                 id=new_id,
                 kind=encode_conversation_kind(kind),
@@ -835,7 +901,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
             with self._session() as meta_sess:
                 meta_sess.add(meta)
-            return _to_conversation(row, meta)
+            return _to_conversation(row, meta, agent_config=agent_config)
         except IntegrityError as exc:
             # Translate the unique-index violation into a
             # clean exception type the spawn/send tools can map
@@ -881,8 +947,13 @@ class SqlAlchemyConversationStore(ConversationStore):
             row = session.get(SqlConversation, (current_workspace_id(), conversation_id))
             if row is None:
                 return None
+            agent_config = session.get(
+                SqlAgentConfiguration, (current_workspace_id(), conversation_id)
+            )
             meta = self._get_meta(session, conversation_id)
-            return _to_conversation(row, meta, _fetch_labels(session, conversation_id))
+            return _to_conversation(
+                row, meta, _fetch_labels(session, conversation_id), agent_config
+            )
 
     def get_runner_ids(self, conversation_ids: list[str]) -> dict[str, str | None]:
         """
@@ -995,6 +1066,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             # too — _to_conversation reads ORM columns, which would raise
             # DetachedInstanceError once the session closes.
             labels_by_conv = _fetch_labels_bulk(session, [row.id for row in rows])
+            configs_by_id = self._fetch_agent_configurations(session, [row.id for row in rows])
         meta_rows = []
         if rows:
             row_ids = [r.id for r in rows]
@@ -1011,7 +1083,12 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
         meta_by_id = {m.id: m for m in meta_rows}
         return {
-            row.id: _to_conversation(row, meta_by_id.get(row.id), labels_by_conv.get(row.id, {}))
+            row.id: _to_conversation(
+                row,
+                meta_by_id.get(row.id),
+                labels_by_conv.get(row.id, {}),
+                configs_by_id.get(row.id),
+            )
             for row in rows
         }
 
@@ -1993,9 +2070,17 @@ class SqlAlchemyConversationStore(ConversationStore):
                     SqlConversation.root_conversation_id == root_conversation_id,
                 )
             if has_agent_id is True:
-                stmt = stmt.where(SqlConversation.agent_id.is_not(None))
+                stmt = stmt.where(
+                    SqlConversation.id.in_(
+                        select(SqlAgentConfiguration.conversation_id).where(
+                            SqlAgentConfiguration.workspace_id == current_workspace_id(),
+                            SqlAgentConfiguration.agent_id.is_not(None),
+                        )
+                    )
+                )
             if agent_name is not None:
-                # Agents live in the Omnigent DB — resolve to IDs first, then filter.
+                # Agents live in the Omnigent DB — resolve to IDs first, then
+                # filter via agent_configuration (same DB as conversations).
                 with self._session() as agent_sess:
                     agent_ids_for_name = list(
                         agent_sess.execute(
@@ -2007,13 +2092,26 @@ class SqlAlchemyConversationStore(ConversationStore):
                         .scalars()
                         .all()
                     )
-                stmt = stmt.where(SqlConversation.agent_id.in_(agent_ids_for_name))
+                stmt = stmt.where(
+                    SqlConversation.id.in_(
+                        select(SqlAgentConfiguration.conversation_id).where(
+                            SqlAgentConfiguration.workspace_id == current_workspace_id(),
+                            SqlAgentConfiguration.agent_id.in_(agent_ids_for_name),
+                        )
+                    )
+                )
             if agent_id is not None:
-                # Filter by the agent_id column on conversations directly
-                # (the tasks table has been removed). Conversations without
-                # an agent binding (legacy rows) correctly return no results
-                # because their agent_id column is NULL.
-                stmt = stmt.where(SqlConversation.agent_id == agent_id)
+                # Conversations without an agent binding (legacy rows)
+                # correctly return no results: their agent_configuration row has
+                # agent_id NULL.
+                stmt = stmt.where(
+                    SqlConversation.id.in_(
+                        select(SqlAgentConfiguration.conversation_id).where(
+                            SqlAgentConfiguration.workspace_id == current_workspace_id(),
+                            SqlAgentConfiguration.agent_id == agent_id,
+                        )
+                    )
+                )
             if title is not None:
                 stmt = stmt.where(SqlConversation.title == title)
             if search_query:
@@ -2077,9 +2175,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             if has_more:
                 rows = rows[:limit]
             row_ids = [r.id for r in rows]
-            # Fetch labels for all returned conversations in a
-            # single IN-clause query so the list-path is O(1)
-            # queries regardless of page size.
+            # Fetch labels and agent-configuration rows for all returned
+            # conversations in single IN-clause queries so the list-path is
+            # O(1) queries regardless of page size.
             labels_by_conv = _fetch_labels_bulk(session, row_ids)
             # On a content search, fetch a preview excerpt of the matching
             # chat text so the UI can show *where* each session matched (the
@@ -2089,8 +2187,11 @@ class SqlAlchemyConversationStore(ConversationStore):
             snippets = (
                 _fetch_search_snippets(session, row_ids, search_query) if search_query else {}
             )
+            configs_by_id = self._fetch_agent_configurations(session, row_ids)
             # Build AP-only entities; metadata fetched separately below.
-            ap_entities = [(r, labels_by_conv.get(r.id, {})) for r in rows]
+            ap_entities = [
+                (r, labels_by_conv.get(r.id, {}), configs_by_id.get(r.id)) for r in rows
+            ]
 
         # Fetch metadata from Omnigent DB and merge.
         meta_by_id: dict[str, SqlConversationMetadata] = {}
@@ -2109,7 +2210,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                 # Access .id inside the session to avoid DetachedInstanceError.
                 meta_by_id = {m.id: m for m in meta_rows}
                 convs = [
-                    _to_conversation(r, meta_by_id.get(r.id), labels) for r, labels in ap_entities
+                    _to_conversation(r, meta_by_id.get(r.id), labels, agent_config)
+                    for r, labels, agent_config in ap_entities
                 ]
         else:
             convs = []
@@ -2252,35 +2354,48 @@ class SqlAlchemyConversationStore(ConversationStore):
             if the conversation does not exist.
         """
         now = now_epoch()
-        # Two separate transactions: AP (conversation row) and Omnigent (metadata).
+        # Two separate transactions: AP (conversation + agent_configuration rows,
+        # same DB) and Omnigent (metadata).
         with self._conv_session() as ap_sess:
             row = ap_sess.get(SqlConversation, (current_workspace_id(), conversation_id))
             if not row:
                 return None
+            agent_config = ap_sess.get(
+                SqlAgentConfiguration, (current_workspace_id(), conversation_id)
+            )
+            if agent_config is None:
+                # Repair a conversation missing its paired agent_configuration
+                # row; same transaction, so the pair stays consistent.
+                _logger.warning(
+                    "conversation %s has no agent_configuration row; recreating it",
+                    conversation_id,
+                )
+                agent_config = _new_agent_configuration_row(conversation_id)
+                ap_sess.add(agent_config)
             ap_changed = False
             if title is not None:
                 row.title = title or ""
                 ap_changed = True
             if _unset_reasoning_effort:
-                row.reasoning_effort = None
+                agent_config.reasoning_effort = None
                 ap_changed = True
             elif reasoning_effort is not None:
-                row.reasoning_effort = reasoning_effort
+                agent_config.reasoning_effort = reasoning_effort
                 ap_changed = True
             if _unset_model_override:
-                row.model_override = None
+                agent_config.model_override = None
                 ap_changed = True
             elif model_override is not None:
-                row.model_override = model_override
+                agent_config.model_override = model_override
                 ap_changed = True
             if _unset_cost_control_mode_override:
-                row.cost_control_mode_override = None
+                agent_config.cost_control_mode_override = None
                 ap_changed = True
             elif cost_control_mode_override is not None:
-                row.cost_control_mode_override = cost_control_mode_override
+                agent_config.cost_control_mode_override = cost_control_mode_override
                 ap_changed = True
             if harness_override is not None:
-                row.harness_override = harness_override
+                agent_config.harness_override = harness_override
                 ap_changed = True
             if archived is not None:
                 ap_changed = True  # archived is a visible state change
@@ -2483,7 +2598,11 @@ class SqlAlchemyConversationStore(ConversationStore):
                 .scalars()
                 .all()
             )
-        return [_to_conversation(r, meta_by_id.get(r.id)) for r in ap_rows]
+            configs_by_id = self._fetch_agent_configurations(ap_sess, [r.id for r in ap_rows])
+        return [
+            _to_conversation(r, meta_by_id.get(r.id), agent_config=configs_by_id.get(r.id))
+            for r in ap_rows
+        ]
 
     def set_host_id(
         self,
@@ -2688,14 +2807,17 @@ class SqlAlchemyConversationStore(ConversationStore):
             conversation_id,
             now,
             title,
-            reasoning_effort,
             parent_conversation_id=parent_conversation_id,
             root_conversation_id=root_conversation_id,
         )
+        agent_config_row = _new_agent_configuration_row(
+            conversation_id,
+            agent_id=agent_id,
+            reasoning_effort=reasoning_effort,
+        )
         with self._conv_session() as ap_sess:
             ap_sess.add(conversation_row)
-            ap_sess.flush()
-            conversation_row.agent_id = agent_id
+            ap_sess.add(agent_config_row)
             if labels:
                 _upsert_labels(ap_sess, conversation_id, labels, now)
 
@@ -2718,7 +2840,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             session.add(meta_row)
             session.flush()
 
-        return _created_session_from_rows(conversation_row, meta_row, agent_row, labels)
+        return _created_session_from_rows(
+            conversation_row, meta_row, agent_config_row, agent_row, labels
+        )
 
     def fork_conversation(
         self,
@@ -2835,6 +2959,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             source = session.get(SqlConversation, (current_workspace_id(), source_conversation_id))
             if source is None:
                 raise LookupError(f"conversation not found: {source_conversation_id!r}")
+            source_config = session.get(
+                SqlAgentConfiguration, (current_workspace_id(), source_conversation_id)
+            )
 
             fork_title = (
                 title
@@ -2845,9 +2972,6 @@ class SqlAlchemyConversationStore(ConversationStore):
                     else f"Fork of {source_conversation_id[:16]}…"
                 )
             )
-            # Cloning the agent in-transaction: start the conversation with
-            # agent_id=NULL (the row doesn't exist yet — an autoflush would
-            # else break the agent_id FK) and backfill after inserting it.
             creating_clone = cloned_agent_bundle_location is not None
             new_conv = SqlConversation(
                 id=new_conv_id,
@@ -2858,18 +2982,34 @@ class SqlAlchemyConversationStore(ConversationStore):
                 # root mirrors its own id (matches the
                 # ``_new_session_conversation_row`` invariant).
                 root_conversation_id=new_conv_id,
-                agent_id=(
-                    None
-                    if creating_clone
-                    else (agent_id if agent_id is not None else source.agent_id)
-                ),
-                reasoning_effort=source.reasoning_effort if copy_model_settings else None,
-                model_override=source.model_override if copy_model_settings else None,
-                # The brain-harness override is family-bound like the model,
-                # so it follows the same copy gate.
-                harness_override=source.harness_override if copy_model_settings else None,
             )
             session.add(new_conv)
+            # Paired agent-configuration row: an explicit agent_id (clone or
+            # existing) beats inheriting the source's binding.
+            new_config = _new_agent_configuration_row(
+                new_conv_id,
+                agent_id=(
+                    agent_id
+                    if agent_id is not None
+                    else (source_config.agent_id if source_config else None)
+                ),
+                reasoning_effort=(
+                    source_config.reasoning_effort
+                    if copy_model_settings and source_config
+                    else None
+                ),
+                model_override=(
+                    source_config.model_override if copy_model_settings and source_config else None
+                ),
+                # The brain-harness override is family-bound like the model,
+                # so it follows the same copy gate.
+                harness_override=(
+                    source_config.harness_override
+                    if copy_model_settings and source_config
+                    else None
+                ),
+            )
+            session.add(new_config)
 
             # Resolve the truncation cutoff: the position of the LAST item
             # of the selected response, so the fork never ends mid-turn.
@@ -2945,21 +3085,15 @@ class SqlAlchemyConversationStore(ConversationStore):
             # even when the source predates the counter.
             new_conv.next_position = len(source_items)
 
-            # Create/bind the fork's session-scoped agent atomically.
+            # Cloned agent: the row itself is written to the Omnigent DB after
+            # the AP session commits (see the block below the with-statement);
+            # the fork's binding already lives on new_config.agent_id.
             if creating_clone:
-                # The cloned agent is written to the Omnigent DB after the AP
-                # session commits (see the block below the with-statement).
                 assert (
                     agent_id is not None
                     and cloned_agent_name is not None
                     and cloned_agent_bundle_location is not None
                 )
-                new_conv.agent_id = agent_id
-            elif agent_id is not None:
-                # Binding an existing (template) agent to the fork: the forward
-                # pointer conversations.agent_id is the sole link; no back-pointer
-                # to update.
-                new_conv.agent_id = agent_id
 
             # Copy labels from the source conversation, minus the
             # instance-scoped ones (native bridge ids, context metrics)
@@ -3041,7 +3175,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     )
                 )
 
-        return _to_conversation(new_conv, fork_meta, fork_labels)
+        return _to_conversation(new_conv, fork_meta, fork_labels, new_config)
 
     def switch_conversation_agent(
         self,
@@ -3100,18 +3234,24 @@ class SqlAlchemyConversationStore(ConversationStore):
         if previous_builtin_id is not None:
             upserts[SWITCH_PREVIOUS_BUILTIN_LABEL_KEY] = previous_builtin_id
 
-        # AP holds conversation+labels; Omnigent holds agent+metadata.
-        # Read old_agent_id from AP before overwriting it.
+        # AP holds conversation+labels+agent_configuration; Omnigent holds
+        # agent+metadata. Read old_agent_id from AP before overwriting it.
         with self._conv_session() as ap_sess:
             row = ap_sess.get(SqlConversation, (current_workspace_id(), conversation_id))
             if row is None:
                 raise LookupError(f"conversation not found: {conversation_id!r}")
-            old_agent_id = row.agent_id
-            row.agent_id = new_agent_id
+            agent_config = ap_sess.get(
+                SqlAgentConfiguration, (current_workspace_id(), conversation_id)
+            )
+            if agent_config is None:
+                agent_config = _new_agent_configuration_row(conversation_id)
+                ap_sess.add(agent_config)
+            old_agent_id = agent_config.agent_id
+            agent_config.agent_id = new_agent_id
             if not copy_model_settings:
-                row.model_override = None
-                row.reasoning_effort = None
-            row.harness_override = None
+                agent_config.model_override = None
+                agent_config.reasoning_effort = None
+            agent_config.harness_override = None
             row.updated_at = now
 
             existing = _fetch_labels(ap_sess, conversation_id)
@@ -3204,6 +3344,12 @@ class SqlAlchemyConversationStore(ConversationStore):
                 delete(SqlConversationLabel).where(
                     SqlConversationLabel.workspace_id == current_workspace_id(),
                     SqlConversationLabel.conversation_id.in_(subtree_ids),
+                )
+            )
+            ap_sess.execute(
+                delete(SqlAgentConfiguration).where(
+                    SqlAgentConfiguration.workspace_id == current_workspace_id(),
+                    SqlAgentConfiguration.conversation_id.in_(subtree_ids),
                 )
             )
             ap_sess.execute(

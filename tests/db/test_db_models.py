@@ -16,6 +16,7 @@ from sqlalchemy.exc import IntegrityError, OperationalError
 from omnigent.db.db_models import (
     SqlAccountToken,
     SqlAgent,
+    SqlAgentConfiguration,
     SqlComment,
     SqlConversation,
     SqlConversationItem,
@@ -65,7 +66,6 @@ def _make_agent(
 
 def _make_conversation(
     id: str = "conv_test1",
-    agent_id: str | None = None,
     parent_conversation_id: str | None = None,
     root_conversation_id: str | None = None,
     title: str | None = None,
@@ -74,11 +74,17 @@ def _make_conversation(
         id=id,
         created_at=_now(),
         updated_at=_now(),
-        agent_id=agent_id,
         parent_conversation_id=parent_conversation_id,
         root_conversation_id=root_conversation_id or id,
         title=title,
     )
+
+
+def _make_agent_configuration(
+    conversation_id: str = "conv_test1",
+    agent_id: str | None = None,
+) -> SqlAgentConfiguration:
+    return SqlAgentConfiguration(conversation_id=conversation_id, agent_id=agent_id)
 
 
 def _make_metadata(
@@ -350,20 +356,24 @@ class TestSqlConversation:
             loaded = session.get(SqlConversation, (0, "conv_test1"))
             assert loaded is not None
             assert loaded.title == "Hello World"
-            # AP-side columns only; kind/archived live on SqlConversationMetadata.
-            assert loaded.reasoning_effort is None
-            assert loaded.model_override is None
+            # Identity/hierarchy columns only; kind/archived live on
+            # SqlConversationMetadata, agent binding + overrides on
+            # SqlAgentConfiguration.
+            assert loaded.root_conversation_id == "conv_test1"
+            assert loaded.next_position == 0
 
     def test_defaults(self, db_uri: str) -> None:
         engine = get_or_create_engine(db_uri)
         managed = make_managed_session_maker(engine)
 
         conv = _make_conversation()
+        agent_config = _make_agent_configuration()
         with managed() as session:
             session.add(conv)
+            session.add(agent_config)
 
         with managed() as session:
-            loaded = session.get(SqlConversation, (0, "conv_test1"))
+            loaded = session.get(SqlAgentConfiguration, (0, "conv_test1"))
             assert loaded is not None
             assert loaded.reasoning_effort is None
             assert loaded.model_override is None
