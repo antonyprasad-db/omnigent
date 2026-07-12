@@ -341,3 +341,43 @@ def test_fork_conversation_copies_to_both_dbs(
     assert _count(conv_db, "conversations") == 2
     assert _count(omnigent_db, "omnigent_conversation_metadata") == 2
     assert _count(conv_db, "conversation_items") == 2  # original + copy
+
+
+# ── AgentStore cross-DB session_id resolution ────────────────────────
+
+
+def test_agent_store_resolves_session_id_across_dbs(
+    omnigent_db: Path,
+    conv_db: Path,
+    store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    ``agent.session_id`` requires a reverse lookup on
+    ``conversations.agent_id``, which lives in the AP DB. An AgentStore
+    wired only to the Omnigent DB would query the wrong database and
+    silently return ``session_id=None`` for every session-scoped agent.
+    """
+    from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+
+    created = store.create_session_with_agent(
+        agent_id="ag_split_1",
+        agent_name="session-agent",
+        agent_bundle_location="ag_split_1/bundle",
+        agent_description=None,
+        title="split session",
+    )
+    # Agent row lands in the Omnigent DB; conversation row in the AP DB.
+    assert _count(omnigent_db, "agents") == 1
+    assert _col(conv_db, "conversations", "agent_id") == ["ag_split_1"]
+
+    agent_store = SqlAlchemyAgentStore(
+        f"sqlite:///{omnigent_db}",
+        f"sqlite:///{conv_db}",
+    )
+    agent = agent_store.get("ag_split_1")
+    assert agent is not None
+    assert agent.session_id == created.conversation.id
+
+    updated = agent_store.update("ag_split_1", "ag_split_1/bundle2")
+    assert updated is not None
+    assert updated.session_id == created.conversation.id
