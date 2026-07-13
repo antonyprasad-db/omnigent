@@ -151,15 +151,19 @@ def downgrade() -> None:
         )
         """
     )
+    # ``workspace`` must be restored BEFORE ``host_id``: the check constraint
+    # re-created above (host_id IS NULL OR workspace IS NOT NULL) is checked
+    # per statement, so restoring host_id first would fire it on every
+    # host-bound row while its workspace is still NULL.
     for col in (
         "runner_id",
+        "workspace",
         "host_id",
         "sub_agent_name",
         "external_session_id",
         "session_state",
         "session_usage",
         "terminal_launch_args",
-        "workspace",
         "git_branch",
         "archived",
     ):
