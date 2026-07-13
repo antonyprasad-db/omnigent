@@ -3334,8 +3334,12 @@ class SqlAlchemyConversationStore(ConversationStore):
             subtree_ids = [r[0] for r in ap_sess.execute(select(cte.c.id)).fetchall()]
             # Collect the subtree's agent bindings before their rows go, so
             # the Omnigent transaction below can delete the session-scoped
-            # agent rows that backed these conversations.
-            bound_agent_ids = set(
+            # agent rows that backed these conversations. Only include agents
+            # with NO surviving reference outside the deleted subtree: a
+            # session-scoped agent may be referenced by multiple conversations
+            # (e.g. when POST /v1/sessions reuses an existing agent_id), and
+            # should only be removed when ALL its referrers are deleted.
+            candidate_agent_ids = set(
                 ap_sess.execute(
                     select(SqlAgentConfiguration.agent_id).where(
                         SqlAgentConfiguration.workspace_id == current_workspace_id(),
@@ -3346,6 +3350,20 @@ class SqlAlchemyConversationStore(ConversationStore):
                 .scalars()
                 .all()
             )
+            # Keep only agents that have no remaining reference outside the
+            # subtree being deleted.
+            surviving_refs = set(
+                ap_sess.execute(
+                    select(SqlAgentConfiguration.agent_id).where(
+                        SqlAgentConfiguration.workspace_id == current_workspace_id(),
+                        SqlAgentConfiguration.agent_id.in_(candidate_agent_ids),
+                        SqlAgentConfiguration.conversation_id.not_in(subtree_ids),
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            bound_agent_ids = candidate_agent_ids - surviving_refs
             for conv_id in subtree_ids:
                 delete_fts_by_conversation(ap_sess, conv_id)
             ap_sess.execute(
