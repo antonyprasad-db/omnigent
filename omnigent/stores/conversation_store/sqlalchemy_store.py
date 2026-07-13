@@ -3332,6 +3332,20 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
             )
             subtree_ids = [r[0] for r in ap_sess.execute(select(cte.c.id)).fetchall()]
+            # Collect the subtree's agent bindings before their rows go, so
+            # the Omnigent transaction below can delete the session-scoped
+            # agent rows that backed these conversations.
+            bound_agent_ids = set(
+                ap_sess.execute(
+                    select(SqlAgentConfiguration.agent_id).where(
+                        SqlAgentConfiguration.workspace_id == current_workspace_id(),
+                        SqlAgentConfiguration.conversation_id.in_(subtree_ids),
+                        SqlAgentConfiguration.agent_id.is_not(None),
+                    )
+                )
+                .scalars()
+                .all()
+            )
             for conv_id in subtree_ids:
                 delete_fts_by_conversation(ap_sess, conv_id)
             ap_sess.execute(
@@ -3386,5 +3400,17 @@ class SqlAlchemyConversationStore(ConversationStore):
                     SqlConversationMetadata.id.in_(subtree_ids),
                 )
             )
+            if bound_agent_ids:
+                # Session-scoped agents are 1:1 with their conversation
+                # (forks always clone a fresh agent), so every binding
+                # collected from the deleted subtree is dead. Template
+                # agents are shared and survive via the kind guard.
+                session.execute(
+                    delete(SqlAgent).where(
+                        SqlAgent.workspace_id == current_workspace_id(),
+                        SqlAgent.id.in_(bound_agent_ids),
+                        SqlAgent.kind == encode_agent_kind("session"),
+                    )
+                )
 
         return True

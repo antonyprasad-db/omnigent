@@ -429,3 +429,45 @@ def test_update_conversation_repairs_missing_metadata(
     assert sorted(_col(omnigent_db, "omnigent_conversation_metadata", "id")) == sorted(
         [parent.id, child.id]
     )
+
+
+# ── Session-scoped agent cleanup on conversation delete ───────────────
+
+
+def test_delete_conversation_deletes_session_scoped_agent(
+    omnigent_db: Path,
+    conv_db: Path,
+    store: SqlAlchemyConversationStore,
+) -> None:
+    """Deleting a session deletes the session-scoped agent row backing it."""
+    created = store.create_session_with_agent(
+        agent_id="ag_del_1",
+        agent_name="del-agent",
+        agent_bundle_location="ag_del_1/bundle",
+        agent_description=None,
+        title="del session",
+    )
+    assert _count(omnigent_db, "agents") == 1
+
+    asyncio.run(store.delete_conversation(created.conversation.id))
+    assert _count(omnigent_db, "agents") == 0
+    assert _count(conv_db, "agent_configuration") == 0
+
+
+def test_delete_conversation_keeps_template_agent(
+    omnigent_db: Path,
+    conv_db: Path,
+    store: SqlAlchemyConversationStore,
+) -> None:
+    """Template agents are shared; deleting a bound session must not delete them."""
+    from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+
+    agent_store = SqlAlchemyAgentStore(
+        f"sqlite:///{omnigent_db}",
+        f"sqlite:///{conv_db}",
+    )
+    template = agent_store.create("ag_tmpl_1", "shared-template", "ag_tmpl_1/bundle")
+    conv = store.create_conversation(title="uses template", agent_id=template.id)
+
+    asyncio.run(store.delete_conversation(conv.id))
+    assert _col(omnigent_db, "agents", "id") == ["ag_tmpl_1"]
