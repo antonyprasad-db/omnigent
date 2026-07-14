@@ -22,7 +22,7 @@ Wired connectors (both **read-only** by default):
 ## Run
 
 ```bash
-AWS_PROFILE=my-profile AWS_REGION=us-east-1 omnigent run examples/aws-analyst
+AWS_PROFILE=my-profile AWS_REGION=us-east-1 omnigent run examples/aws_analyst
 ```
 
 ## Notes

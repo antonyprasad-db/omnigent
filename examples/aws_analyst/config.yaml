@@ -12,10 +12,10 @@
 #   - AWS credentials resolvable by the servers (AWS_PROFILE + AWS_REGION, or a role).
 #
 # Usage:
-#   AWS_PROFILE=my-profile AWS_REGION=us-east-1 omnigent run examples/aws-analyst
+#   AWS_PROFILE=my-profile AWS_REGION=us-east-1 omnigent run examples/aws_analyst
 
 spec_version: 1
-name: aws-analyst
+name: aws_analyst
 description: >-
   An analyst agent that answers questions over governed AWS data — Amazon Redshift
   and Amazon S3 Tables — through the official awslabs MCP servers (read-only).
