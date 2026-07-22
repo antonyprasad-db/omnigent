@@ -59,26 +59,34 @@ def main() -> int:
     image_arn = f"arn:aws:lambda:{REGION}:{ACCOUNT_ID}:microvm-image:{IMAGE_NAME}"
 
     print(f"==> create_microvm_image {IMAGE_NAME} (hooks ENABLED)")
-    lm.create_microvm_image(
-        name=IMAGE_NAME,
-        baseImageArn=f"arn:aws:lambda:{REGION}:aws:microvm-image:al2023-1",
-        buildRoleArn=f"arn:aws:iam::{ACCOUNT_ID}:role/omnigent-microvm-build",
-        codeArtifact={"uri": f"s3://{ARTIFACT_BUCKET}/omnigent-host-microvm.zip"},
-        # THE FIX: enable the lifecycle hooks the provider relies on. Omitting
-        # this is what makes RunMicrovm fail with the run-hook ValidationException.
-        hooks={
-            "port": HOOKS_PORT,
-            "microvmImageHooks": {"ready": "ENABLED"},
-            "microvmHooks": {
-                "run": "ENABLED",
-                "resume": "ENABLED",
-                "suspend": "ENABLED",
-                "terminate": "ENABLED",
+    try:
+        lm.create_microvm_image(
+            name=IMAGE_NAME,
+            baseImageArn=f"arn:aws:lambda:{REGION}:aws:microvm-image:al2023-1",
+            buildRoleArn=f"arn:aws:iam::{ACCOUNT_ID}:role/omnigent-microvm-build",
+            codeArtifact={"uri": f"s3://{ARTIFACT_BUCKET}/omnigent-host-microvm.zip"},
+            # THE FIX: enable the lifecycle hooks the provider relies on. Omitting
+            # this is what makes RunMicrovm fail with the run-hook ValidationException.
+            hooks={
+                "port": HOOKS_PORT,
+                "microvmImageHooks": {"ready": "ENABLED"},
+                "microvmHooks": {
+                    "run": "ENABLED",
+                    "resume": "ENABLED",
+                    "suspend": "ENABLED",
+                    "terminate": "ENABLED",
+                },
             },
-        },
-    )
+        )
+    except lm.exceptions.ConflictException:
+        # Re-run against an image that already exists: skip creation and just
+        # poll/report the current state. To rebuild from scratch, delete the
+        # image (or its last version) first — note delete→recreate hits a
+        # ~40s ConflictException window while the old image drains.
+        print(f"    image {IMAGE_NAME} already exists — polling current state "
+              "(delete it first to rebuild)")
 
-    print("==> polling for build completion (~5-15 min on first build)")
+    print("==> polling for build completion (up to ~30 min; typically 5-15)")
     for _ in range(120):
         img = lm.get_microvm_image(imageIdentifier=image_arn)
         state = img.get("state")

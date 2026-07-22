@@ -61,6 +61,12 @@ drives the control plane:
   plus `lambda:PassNetworkConnector` for the build's egress and `iam:PassRole`
   on the build + exec roles.
 
+  > The template's `operator-role-trust.json` trusts the **account root**
+  > (`arn:aws:iam::<ACCOUNT_ID>:root`), so any principal in the account can
+  > assume it and reach the full MicroVM control plane. That's convenient for a
+  > sandbox; for production, scope the trust to the specific server/operator
+  > principal instead.
+
 ## Build the MicroVM image
 
 The microVM runs the official Omnigent host image plus a tiny lifecycle-hooks

@@ -19,7 +19,6 @@ set -euo pipefail
 : "${ARTIFACT_BUCKET:=omnigent-microvm-artifacts-${ACCOUNT_ID}}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 IAM="${HERE}/iam"
-TAG="project=omnigent-microvm"
 
 render() { sed -e "s/<ACCOUNT_ID>/${ACCOUNT_ID}/g" -e "s/<REGION>/${REGION}/g" \
                 -e "s/<ARTIFACT_BUCKET>/${ARTIFACT_BUCKET}/g" "$1"; }
@@ -31,6 +30,10 @@ aws s3api create-bucket --bucket "${ARTIFACT_BUCKET}" --region "${REGION}" \
 aws s3api put-public-access-block --bucket "${ARTIFACT_BUCKET}" \
   --public-access-block-configuration \
   BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+# Tag the bucket to match the roles, so everything this script creates shares
+# one tag (project=omnigent-microvm) for easy discovery and teardown.
+aws s3api put-bucket-tagging --bucket "${ARTIFACT_BUCKET}" \
+  --tagging 'TagSet=[{Key=project,Value=omnigent-microvm}]' 2>/dev/null || true
 
 create_role() {  # name  trust-file  perms-file  inline-policy-name
   local name="$1" trust="$2" perms="$3" pol="$4"
