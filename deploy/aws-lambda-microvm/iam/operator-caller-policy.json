@@ -1,0 +1,40 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "LambdaMicroVMsControlPlane",
+      "Effect": "Allow",
+      "Action": [
+        "lambda:CreateMicrovmImage",
+        "lambda:GetMicrovmImage",
+        "lambda:GetMicrovmImageBuild",
+        "lambda:GetMicrovmImageVersion",
+        "lambda:ListMicrovmImages",
+        "lambda:ListManagedMicrovmImageVersions",
+        "lambda:DeleteMicrovmImage",
+        "lambda:DeleteMicrovmImageVersion",
+        "lambda:RunMicrovm",
+        "lambda:GetMicrovm",
+        "lambda:SuspendMicrovm",
+        "lambda:ResumeMicrovm",
+        "lambda:StopMicrovm",
+        "lambda:CreateMicrovmAuthToken",
+        "lambda:CreateMicrovmShellAuthToken",
+        "lambda:TagResource",
+        "lambda:UntagResource",
+        "lambda:ListTags",
+        "lambda:PassNetworkConnector"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "PassMicroVMRoles",
+      "Effect": "Allow",
+      "Action": "iam:PassRole",
+      "Resource": [
+        "arn:aws:iam::<ACCOUNT_ID>:role/omnigent-microvm-build",
+        "arn:aws:iam::<ACCOUNT_ID>:role/omnigent-microvm-exec"
+      ]
+    }
+  ]
+}

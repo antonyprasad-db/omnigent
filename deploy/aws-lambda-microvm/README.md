@@ -39,9 +39,12 @@ role. Lambda MicroVMs is available in `us-east-1`, `us-east-2`, `us-west-2`,
 `ap-northeast-1` (Tokyo), and `eu-west-1` (Ireland); pin a region your server
 can reach.
 
-## IAM: two roles
+## IAM
 
-Lambda MicroVMs uses two roles (see the AWS docs for exact trust policies):
+Ready-to-render policy templates are in [`iam/`](./iam/) (placeholders
+`<ACCOUNT_ID>`, `<REGION>`, `<ARTIFACT_BUCKET>`); `setup.sh` renders and applies
+them. Two roles are passed to the service, plus a caller policy for whoever
+drives the control plane:
 
 - **Build role** (`buildRoleArn`) — assumed while `create-microvm-image` builds
   the image. Needs `s3:GetObject` on your artifact bucket and CloudWatch Logs
@@ -51,6 +54,12 @@ Lambda MicroVMs uses two roles (see the AWS docs for exact trust policies):
   Needs CloudWatch Logs write. Add `bedrock:InvokeModel` here if you want
   runners to reach Bedrock through the role instead of a long-lived key in the
   microVM environment (see "Credentials" below).
+- **Caller policy** (`iam/operator-caller-policy.json`) — for the principal that
+  calls the control plane (the server, or an operator building the image). Note
+  the IAM action namespace is **`lambda:`**, not `lambda-microvms:`
+  (`lambda:CreateMicrovmImage`, `lambda:RunMicrovm`, `lambda:SuspendMicrovm`, …),
+  plus `lambda:PassNetworkConnector` for the build's egress and `iam:PassRole`
+  on the build + exec roles.
 
 ## Build the MicroVM image
 
@@ -59,6 +68,28 @@ shim. `Dockerfile` in this directory layers that shim on
 `ghcr.io/omnigent-ai/omnigent-host:latest` (the host image already publishes for
 arm64, which Lambda MicroVMs require, so no cross-build is needed on a Graviton
 builder; on an x86 host, register QEMU first).
+
+> [!TIP]
+> **Scripted quickstart.** `setup.sh` (IAM roles + bucket + upload) and
+> `build_image.py` (image build) in this directory automate the steps below,
+> including the two gotchas the manual snippet misses (hooks + CLI version). A
+> full end-to-end validation walkthrough — server config, single-user auth,
+> key-free Bedrock, and the `resume_preserves_host` check — is in
+> [`RUNBOOK-live-validation.md`](./RUNBOOK-live-validation.md).
+
+> [!IMPORTANT]
+> Two things the manual one-liner below leaves out that will bite you:
+>
+> - **The image must be built with lifecycle hooks ENABLED.** The provider
+>   delivers per-launch identity through the `/run` hook, so without
+>   `run`/`resume`/`suspend`/`terminate` (+ the `ready` image hook) enabled at
+>   `create-microvm-image` time, the image builds fine but the first
+>   `RunMicrovm` fails: `ValidationException: The run hook must be enabled in the
+>   MicroVM image to pass the run hook payload`. `build_image.py` sets these.
+> - **`lambda-microvms` is newer than awscli v2.34.x**, which doesn't know the
+>   service. Use **boto3 >= 1.43** (what `build_image.py` uses) for the build/run
+>   calls; the `aws lambda-microvms ...` form below assumes a CLI new enough to
+>   include it.
 
 ```bash
 # 1. Package the build context (Dockerfile at the zip root, alongside the files
@@ -70,12 +101,14 @@ zip -j omnigent-host-microvm.zip \
   deploy/aws-lambda-microvm/start_host.sh
 aws s3 cp omnigent-host-microvm.zip s3://my-omnigent-artifacts/omnigent-host-microvm.zip
 
-# 2. Build the MicroVM image.
+# 2. Build the MicroVM image. NOTE: --hooks is REQUIRED (see the callout above);
+#    build_image.py sets it for you. Illustrative shape:
 aws lambda-microvms create-microvm-image \
   --name omnigent-host \
   --base-image-arn arn:aws:lambda:<region>:aws:microvm-image:al2023-1 \
   --build-role-arn arn:aws:iam::<acct>:role/omnigent-microvm-build \
-  --code-artifact '{"uri":"s3://my-omnigent-artifacts/omnigent-host-microvm.zip"}'
+  --code-artifact '{"uri":"s3://my-omnigent-artifacts/omnigent-host-microvm.zip"}' \
+  --hooks '{"port":9000,"microvmImageHooks":{"ready":"ENABLED"},"microvmHooks":{"run":"ENABLED","resume":"ENABLED","suspend":"ENABLED","terminate":"ENABLED"}}'
 ```
 
 The launcher's `image_identifier` names the resulting image (`omnigent-host` or
