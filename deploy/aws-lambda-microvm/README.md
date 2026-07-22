@@ -48,8 +48,9 @@ drives the control plane:
 
 - **Build role** (`buildRoleArn`) — assumed while `create-microvm-image` builds
   the image. Needs `s3:GetObject` on your artifact bucket and CloudWatch Logs
-  write. Trusts `lambda.amazonaws.com` with an `aws:SourceAccount` condition
-  (confused-deputy prevention).
+  write. Trusts `lambda.amazonaws.com` for both `sts:AssumeRole` **and**
+  `sts:TagSession` (the build fails without `sts:TagSession`); the
+  `aws:SourceAccount` condition adds confused-deputy prevention.
 - **Execution role** (`executionRoleArn`) — assumed by the running microVM.
   Needs CloudWatch Logs write. Add `bedrock:InvokeModel` here if you want
   runners to reach Bedrock through the role instead of a long-lived key in the

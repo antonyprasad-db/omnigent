@@ -5,7 +5,7 @@
       "Sid": "LambdaMicroVMsBuildAssume",
       "Effect": "Allow",
       "Principal": { "Service": "lambda.amazonaws.com" },
-      "Action": "sts:AssumeRole",
+      "Action": ["sts:AssumeRole", "sts:TagSession"],
       "Condition": {
         "StringEquals": { "aws:SourceAccount": "<ACCOUNT_ID>" }
       }
