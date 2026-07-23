@@ -149,9 +149,46 @@ microVM environment. Secret *values* never live in the config file — only the
 names do, and a name that is unset in the server environment fails the launch
 loud rather than starting a host that can't authenticate.
 
-For a key-free setup, grant the execution role `bedrock:InvokeModel` and point
-runners at Bedrock; the microVM then reaches the model through its role and no
-model key enters the sandbox.
+### Key-free models via Bedrock (recommended on AWS)
+
+Because the MicroVM already assumes an IAM **execution role**, you can skip
+model API keys entirely and have the in-VM runner reach **Amazon Bedrock**
+through that role — no long-lived key ever enters the sandbox. This is the
+natural setup on AWS and avoids putting a model key in the server environment at
+all.
+
+Wiring (verified against a live MicroVM):
+
+1. Grant the execution role Bedrock access (the `iam/exec-role-permissions.json`
+   template already includes this):
+   ```json
+   { "Effect": "Allow",
+     "Action": ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"],
+     "Resource": "*" }
+   ```
+2. Tell the harness to use Bedrock, and pass the flags through to the VM via the
+   config `env:` list (names only — the server exports the values into the VM):
+   ```yaml
+   sandbox:
+     lambda_microvm:
+       # …region / image_identifier / execution_role_arn…
+       env: [CLAUDE_CODE_USE_BEDROCK, AWS_REGION, ANTHROPIC_MODEL]
+   ```
+   ```bash
+   # in the server's environment:
+   export CLAUDE_CODE_USE_BEDROCK=1
+   export AWS_REGION=us-east-1
+   export ANTHROPIC_MODEL=us.anthropic.claude-sonnet-4-20250514-v1:0   # a Bedrock model id
+   ```
+
+The runner's LLM call then runs **inside** the VM and authenticates to Bedrock
+with the execution role's credentials (via IMDS) — so the *server* role does
+**not** need Bedrock, and no `ANTHROPIC_API_KEY` is required anywhere. Confirm
+the chosen model id is enabled in your account's Bedrock model access.
+
+If you'd rather use a hosted API key instead, drop the Bedrock flags and name
+the key in `env:` (e.g. `env: [ANTHROPIC_API_KEY]`) — the server reads its value
+from its own environment at launch, as described above.
 
 ## Lifecycle and caveats
 
