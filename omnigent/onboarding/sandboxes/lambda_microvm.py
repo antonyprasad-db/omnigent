@@ -129,12 +129,20 @@ _DEFAULT_MAX_LIFETIME_S: int = 8 * 60 * 60
 _TOKEN_TTL_SLACK_S: int = 3600
 
 # Idle policy defaults for run-microvm: an idle VM auto-suspends after 15 min of
-# no inbound traffic, may stay suspended up to 30 min before termination, and
-# auto-resumes on the next request. Tuned so a session that sits between turns
-# sleeps to a snapshot instead of holding warm compute, and wakes on the next
-# message via the managed wake path.
+# no inbound traffic, may stay suspended up to the 8 h lifetime cap before
+# termination, and auto-resumes on the next request. Tuned so a session that
+# sits between turns sleeps to a snapshot instead of holding warm compute, and
+# wakes on the next message via the managed wake path.
+#
+# suspendedDurationSeconds is the max time a MicroVM stays SUSPENDED before
+# Lambda TERMINATES it (per the RunMicrovm idle-policy docs), not a
+# suspend-again interval. A short value silently caps how long a between-turns
+# session can sit idle: at 1800s a session idle >30 min is terminated, and the
+# next wake fails (ResourceNotFoundException / 502). maximumDurationInSeconds
+# already bounds total lifetime, so match the suspend budget to it (8 h) and let
+# the lifetime cap be the single knob that ends a VM.
 _DEFAULT_MAX_IDLE_S: int = 900
-_DEFAULT_SUSPENDED_S: int = 1800
+_DEFAULT_SUSPENDED_S: int = _DEFAULT_MAX_LIFETIME_S  # 8 h — see note above
 
 # boto3 service name for the Lambda MicroVMs control plane.
 _SERVICE_NAME: str = "lambda-microvms"
